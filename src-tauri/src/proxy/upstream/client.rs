@@ -1416,7 +1416,11 @@ impl UpstreamClient {
             method,
             query_string,
         );
-        let vertex_body = crate::modules::vertex::prepare_vertex_request_body(body, method);
+        let vertex_body = crate::modules::vertex::prepare_vertex_request_body_for_model(
+            body,
+            method,
+            Some(&vertex_model),
+        );
 
         Ok(VertexPreparedRequest {
             vertex_model,
@@ -3106,6 +3110,38 @@ mod tests {
         .expect("aux dispatch should succeed");
         assert_eq!(aux_prepared.vertex_model, "gemini-3.5-flash");
         assert!(aux_prepared.vertex_body.get("x-agm-vertex-model").is_none());
+
+        // Header-driven Vertex dispatch must clamp Carbon maxOutputTokens using resolved model_hint
+        let mut carbon_headers = std::collections::HashMap::new();
+        carbon_headers.insert(
+            "x-agm-vertex-model".to_string(),
+            "gemini-4-carbon-high".to_string(),
+        );
+        let carbon_body = serde_json::json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }],
+            "generationConfig": {
+                "maxOutputTokens": 262144,
+                "thinkingConfig": { "thinkingLevel": "xhigh" }
+            }
+        });
+        let carbon_prepared = UpstreamClient::prepare_vertex_dispatch(
+            "generateContent",
+            &carbon_body,
+            None,
+            Some(&carbon_headers),
+            Some("acc-1"),
+            &meta,
+        )
+        .expect("carbon dispatch should succeed");
+        assert_eq!(carbon_prepared.vertex_model, "gemini-4-carbon");
+        assert_eq!(
+            carbon_prepared.vertex_body["generationConfig"]["maxOutputTokens"],
+            serde_json::json!(65536)
+        );
+        assert_eq!(
+            carbon_prepared.vertex_body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            serde_json::json!("HIGH")
+        );
     }
 
     #[tokio::test]

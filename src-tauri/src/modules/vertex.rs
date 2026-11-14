@@ -417,7 +417,143 @@ pub fn build_vertex_endpoint_url(
     }
 }
 
-pub fn prepare_vertex_request_body(body: &Value, method: &str) -> Value {
+fn extract_vertex_model_hint(body: &Value) -> Option<&str> {
+    body.get("x-agm-vertex-model")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            body.get("request")
+                .and_then(|r| r.get("x-agm-vertex-model"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| body.get("model").and_then(|v| v.as_str()))
+        .or_else(|| {
+            body.get("request")
+                .and_then(|r| r.get("model"))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+pub fn vertex_max_output_tokens(model_id: &str) -> u32 {
+    if resolve_vertex_model_id(model_id) == "gemini-4-hydrogen" {
+        262_144
+    } else {
+        65_536
+    }
+}
+
+fn sanitize_tool_config(obj: &mut serde_json::Map<String, Value>) {
+    for tc_key in ["toolConfig", "tool_config"] {
+        if let Some(tc_obj) = obj.get_mut(tc_key).and_then(|v| v.as_object_mut()) {
+            for fc_key in ["functionCallingConfig", "function_calling_config"] {
+                if let Some(fc_obj) = tc_obj.get_mut(fc_key).and_then(|v| v.as_object_mut()) {
+                    fc_obj.remove("validatedMode");
+                    fc_obj.remove("validated_mode");
+                }
+            }
+        }
+    }
+}
+
+fn sanitize_content_part_ids(obj: &mut serde_json::Map<String, Value>) {
+    let Some(contents) = obj.get_mut("contents").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for content in contents {
+        let Some(parts) = content.get_mut("parts").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for part in parts {
+            let Some(part_obj) = part.as_object_mut() else {
+                continue;
+            };
+            for key in [
+                "functionCall",
+                "function_call",
+                "functionResponse",
+                "function_response",
+            ] {
+                if let Some(inner) = part_obj.get_mut(key).and_then(|v| v.as_object_mut()) {
+                    inner.remove("id");
+                }
+            }
+        }
+    }
+}
+
+fn sanitize_thinking_config(tc_obj: &mut serde_json::Map<String, Value>) {
+    let mut disable_thinking = false;
+    let mut use_snake =
+        tc_obj.contains_key("include_thoughts") || tc_obj.contains_key("thinking_budget");
+
+    for level_key in ["thinkingLevel", "thinking_level"] {
+        if let Some(level) = tc_obj.get(level_key).and_then(|v| v.as_str()) {
+            if level_key == "thinking_level" {
+                use_snake = true;
+            }
+            if level.eq_ignore_ascii_case("xhigh") {
+                tc_obj.insert(level_key.to_string(), Value::String("HIGH".to_string()));
+            } else if matches!(
+                level.to_ascii_lowercase().as_str(),
+                "off" | "disabled" | "none"
+            ) {
+                disable_thinking = true;
+            }
+        }
+    }
+
+    if disable_thinking {
+        tc_obj.remove("thinkingLevel");
+        tc_obj.remove("thinking_level");
+        if use_snake {
+            tc_obj.insert("include_thoughts".to_string(), Value::Bool(false));
+            tc_obj.insert("thinking_budget".to_string(), serde_json::json!(0));
+        } else {
+            tc_obj.insert("includeThoughts".to_string(), Value::Bool(false));
+            tc_obj.insert("thinkingBudget".to_string(), serde_json::json!(0));
+        }
+    }
+}
+
+fn sanitize_generation_config(obj: &mut serde_json::Map<String, Value>, model_hint: Option<&str>) {
+    let ceiling = model_hint.map(|m| vertex_max_output_tokens(m) as u64);
+
+    for gc_key in ["generationConfig", "generation_config"] {
+        let Some(gc_obj) = obj.get_mut(gc_key).and_then(|v| v.as_object_mut()) else {
+            continue;
+        };
+
+        for tc_key in ["thinkingConfig", "thinking_config"] {
+            if let Some(tc_obj) = gc_obj.get_mut(tc_key).and_then(|v| v.as_object_mut()) {
+                sanitize_thinking_config(tc_obj);
+            }
+        }
+
+        if let Some(max_ceiling) = ceiling {
+            for max_key in ["maxOutputTokens", "max_output_tokens"] {
+                let exceeds = gc_obj.get(max_key).is_some_and(|v| {
+                    v.as_u64().is_some_and(|n| n > max_ceiling)
+                        || v.as_i64().is_some_and(|n| n > max_ceiling as i64)
+                });
+                if exceeds {
+                    gc_obj.insert(max_key.to_string(), serde_json::json!(max_ceiling));
+                }
+            }
+        }
+    }
+}
+
+pub fn prepare_vertex_request_body_for_model(
+    body: &Value,
+    method: &str,
+    model_hint: Option<&str>,
+) -> Value {
+    let effective_model = model_hint
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| extract_vertex_model_hint(body));
+
     let mut unwrapped = if let Some(inner) = body.get("request").and_then(|v| v.as_object()) {
         Value::Object(inner.clone())
     } else {
@@ -442,6 +578,14 @@ pub fn prepare_vertex_request_body(body: &Value, method: &str) -> Value {
             obj.remove(*key);
         }
 
+        for safety_key in ["safetySettings", "safety_settings"] {
+            let remove_safety = matches!(obj.get(safety_key), Some(Value::Null))
+                || matches!(obj.get(safety_key), Some(Value::Array(arr)) if arr.is_empty());
+            if remove_safety {
+                obj.remove(safety_key);
+            }
+        }
+
         if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
             for tool in tools {
                 if let Some(gs) = tool.get_mut("googleSearch").and_then(|v| v.as_object_mut()) {
@@ -451,13 +595,25 @@ pub fn prepare_vertex_request_body(body: &Value, method: &str) -> Value {
             }
         }
 
+        sanitize_tool_config(obj);
+        sanitize_content_part_ids(obj);
+        sanitize_generation_config(obj, effective_model);
+
         if method == "countTokens" {
             obj.remove("safetySettings");
+            obj.remove("safety_settings");
             obj.remove("generationConfig");
+            obj.remove("generation_config");
         }
     }
 
     unwrapped
+}
+
+#[allow(dead_code)]
+pub fn prepare_vertex_request_body(body: &Value, method: &str) -> Value {
+    let model_hint = extract_vertex_model_hint(body);
+    prepare_vertex_request_body_for_model(body, method, model_hint)
 }
 
 pub const VERTEX_MODEL_IDS: &[&str] = &[
@@ -466,7 +622,14 @@ pub const VERTEX_MODEL_IDS: &[&str] = &[
     "gemini-4-argon-medium",
     "gemini-4-argon-low",
     "gemini-4-carbon",
+    "gemini-4-carbon-high",
+    "gemini-4-carbon-medium",
+    "gemini-4-carbon-low",
     "gemini-4-hydrogen",
+    "gemini-4-hydrogen-xhigh",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-medium",
+    "gemini-4-hydrogen-low",
     "gemini-3.8-flash",
     "gemini-3.8-flash-high",
     "gemini-3.8-flash-medium",
@@ -512,11 +675,11 @@ pub fn build_synthetic_vertex_quota() -> QuotaData {
             reset_time: String::new(),
             display_name: None,
             supports_images: None,
-            supports_thinking: None,
+            supports_thinking: Some(!name.contains("image")),
             thinking_budget: None,
             recommended: None,
-            max_tokens: None,
-            max_output_tokens: None,
+            max_tokens: Some(1_048_576),
+            max_output_tokens: Some(vertex_max_output_tokens(name) as i32),
             model: None,
             supported_mime_types: None,
         });
@@ -885,5 +1048,231 @@ mod tests {
         assert!(parse_vertex_credentials(&multi[0].refresh_token)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn test_vertex_model_ids_include_hydrogen_and_carbon_tiers() {
+        for expected in [
+            "gemini-4-carbon",
+            "gemini-4-carbon-high",
+            "gemini-4-carbon-medium",
+            "gemini-4-carbon-low",
+            "gemini-4-hydrogen",
+            "gemini-4-hydrogen-xhigh",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-low",
+        ] {
+            assert!(
+                VERTEX_MODEL_IDS.contains(&expected),
+                "VERTEX_MODEL_IDS missing {}",
+                expected
+            );
+            assert_eq!(
+                resolve_vertex_model_id(expected),
+                if expected.starts_with("gemini-4-hydrogen") {
+                    "gemini-4-hydrogen"
+                } else {
+                    "gemini-4-carbon"
+                }
+            );
+        }
+
+        assert_eq!(vertex_max_output_tokens("gemini-4-hydrogen"), 262_144);
+        assert_eq!(vertex_max_output_tokens("gemini-4-hydrogen-xhigh"), 262_144);
+        assert_eq!(vertex_max_output_tokens("gemini-4-carbon-high"), 65_536);
+
+        let quota = build_synthetic_vertex_quota();
+        let hydrogen_high = quota
+            .models
+            .iter()
+            .find(|m| m.name == "gemini-4-hydrogen-high")
+            .expect("synthetic quota must contain gemini-4-hydrogen-high");
+        assert_eq!(hydrogen_high.max_tokens, Some(1_048_576));
+        assert_eq!(hydrogen_high.max_output_tokens, Some(262_144));
+        assert_eq!(hydrogen_high.supports_thinking, Some(true));
+
+        let carbon_high = quota
+            .models
+            .iter()
+            .find(|m| m.name == "gemini-4-carbon-high")
+            .expect("synthetic quota must contain gemini-4-carbon-high");
+        assert_eq!(carbon_high.max_tokens, Some(1_048_576));
+        assert_eq!(carbon_high.max_output_tokens, Some(65_536));
+        assert_eq!(carbon_high.supports_thinking, Some(true));
+
+        let img = quota
+            .models
+            .iter()
+            .find(|m| m.name == "gemini-2.5-flash-image")
+            .expect("synthetic quota must contain gemini-2.5-flash-image");
+        assert_eq!(img.supports_thinking, Some(false));
+    }
+
+    #[test]
+    fn test_prepare_vertex_request_body_strips_validated_mode_and_normalizes_xhigh() {
+        let wrapped = json!({
+            "project": "p1",
+            "model": "gemini-4-hydrogen-xhigh",
+            "x-agm-vertex-model": "gemini-4-hydrogen-xhigh",
+            "request": {
+                "sessionId": "sess-123",
+                "model": "gemini-4-hydrogen-xhigh",
+                "safetySettings": null,
+                "safety_settings": [],
+                "toolConfig": {
+                    "functionCallingConfig": {
+                        "mode": "ANY",
+                        "allowedFunctionNames": ["search"],
+                        "validatedMode": "STRICT",
+                        "validated_mode": "STRICT"
+                    }
+                },
+                "generationConfig": {
+                    "maxOutputTokens": 262144,
+                    "thinkingConfig": {
+                        "includeThoughts": true,
+                        "thinkingLevel": "xhigh"
+                    }
+                },
+                "contents": [
+                    {
+                        "role": "model",
+                        "parts": [
+                            { "functionCall": { "id": "call-1", "name": "search", "args": {} } }
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "parts": [
+                            { "functionResponse": { "id": "call-1", "name": "search", "response": {} } }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        let prepared = prepare_vertex_request_body(&wrapped, "generateContent");
+        assert!(prepared.get("model").is_none());
+        assert!(prepared.get("sessionId").is_none());
+        assert!(prepared.get("safetySettings").is_none());
+        assert!(prepared.get("safety_settings").is_none());
+        assert_eq!(
+            prepared["toolConfig"]["functionCallingConfig"]["mode"],
+            json!("ANY")
+        );
+        assert_eq!(
+            prepared["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            json!(["search"])
+        );
+        assert!(prepared["toolConfig"]["functionCallingConfig"]
+            .get("validatedMode")
+            .is_none());
+        assert!(prepared["toolConfig"]["functionCallingConfig"]
+            .get("validated_mode")
+            .is_none());
+        assert_eq!(
+            prepared["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            json!("HIGH")
+        );
+        assert_eq!(
+            prepared["generationConfig"]["maxOutputTokens"],
+            json!(262144)
+        );
+        assert!(prepared["contents"][0]["parts"][0]["functionCall"]
+            .get("id")
+            .is_none());
+        assert_eq!(
+            prepared["contents"][0]["parts"][0]["functionCall"]["name"],
+            json!("search")
+        );
+        assert!(prepared["contents"][1]["parts"][0]["functionResponse"]
+            .get("id")
+            .is_none());
+        assert_eq!(
+            prepared["contents"][1]["parts"][0]["functionResponse"]["name"],
+            json!("search")
+        );
+
+        let disabled_body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "generationConfig": {
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingLevel": "off"
+                }
+            }
+        });
+        let prepared_off =
+            prepare_vertex_request_body_for_model(&disabled_body, "generateContent", None);
+        assert!(prepared_off["generationConfig"]["thinkingConfig"]
+            .get("thinkingLevel")
+            .is_none());
+        assert_eq!(
+            prepared_off["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            json!(false)
+        );
+        assert_eq!(
+            prepared_off["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            json!(0)
+        );
+    }
+
+    #[test]
+    fn test_prepare_vertex_request_body_clamps_carbon_max_output_tokens() {
+        let body = json!({
+            "model": "gemini-4-carbon-high",
+            "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }],
+            "generationConfig": {
+                "maxOutputTokens": 262144
+            }
+        });
+
+        let prepared = prepare_vertex_request_body(&body, "generateContent");
+        assert_eq!(
+            prepared["generationConfig"]["maxOutputTokens"],
+            json!(65536)
+        );
+
+        let via_hint = prepare_vertex_request_body_for_model(
+            &json!({
+                "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }],
+                "generation_config": { "max_output_tokens": 262144 }
+            }),
+            "generateContent",
+            Some("gemini-4-carbon-high"),
+        );
+        assert_eq!(
+            via_hint["generation_config"]["max_output_tokens"],
+            json!(65536)
+        );
+    }
+
+    #[test]
+    fn test_official_model_catalog_loads_hydrogen_and_carbon_tiers() {
+        let h_high = crate::models::OfficialModelCatalog::get("gemini-4-hydrogen-high")
+            .expect("gemini-4-hydrogen-high must load from embedded official_models.json");
+        assert_eq!(h_high.max_tokens, Some(1_048_576));
+        assert_eq!(h_high.max_output_tokens, Some(262_144));
+        assert_eq!(h_high.thinking_level.as_deref(), Some("3"));
+
+        let h_xhigh = crate::models::OfficialModelCatalog::get("gemini-4-hydrogen-xhigh")
+            .expect("gemini-4-hydrogen-xhigh must load");
+        assert_eq!(h_xhigh.thinking_level.as_deref(), Some("3"));
+
+        let c_high = crate::models::OfficialModelCatalog::get("gemini-4-carbon-high")
+            .expect("gemini-4-carbon-high must load from embedded official_models.json");
+        assert_eq!(c_high.max_tokens, Some(1_048_576));
+        assert_eq!(c_high.max_output_tokens, Some(262_144));
+        assert_eq!(c_high.thinking_level.as_deref(), Some("3"));
+
+        assert_eq!(
+            crate::proxy::model_specs::get_max_output_tokens("gemini-4-hydrogen-high", None),
+            262_144
+        );
+        assert_eq!(
+            crate::proxy::model_specs::get_max_output_tokens("gemini-4-carbon-high", None),
+            262_144
+        );
     }
 }

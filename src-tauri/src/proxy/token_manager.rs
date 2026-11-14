@@ -1723,11 +1723,12 @@ impl TokenManager {
         }
 
         if is_vertex_sa {
-            if available_models.is_empty() {
-                for &model_id in crate::modules::vertex::VERTEX_MODEL_IDS {
-                    available_models.insert(model_id.to_string());
-                    model_quotas.entry(model_id.to_string()).or_insert(100);
-                }
+            for &model_id in crate::modules::vertex::VERTEX_MODEL_IDS {
+                available_models.insert(model_id.to_string());
+                model_quotas.entry(model_id.to_string()).or_insert(100);
+                model_limits
+                    .entry(model_id.to_string())
+                    .or_insert(crate::modules::vertex::vertex_max_output_tokens(model_id) as u64);
             }
             available_models.retain(|m| crate::modules::vertex::is_vertex_supported_model(m));
             model_quotas.retain(|m, _| crate::modules::vertex::is_vertex_supported_model(m));
@@ -2532,12 +2533,41 @@ impl TokenManager {
     /// # 参数
     /// * `candidates` - 已排序的候选 token 列表
     /// * `attempted` - 已尝试失败的账号 ID 集合
+    fn find_effective_quota(
+        token: &ProxyToken,
+        target_model: &str,
+        normalized_target: &str,
+    ) -> Option<i32> {
+        token
+            .model_quotas
+            .get(normalized_target)
+            .copied()
+            .or_else(|| token.model_quotas.get(target_model).copied())
+            .or_else(|| {
+                let lower = target_model.to_lowercase();
+                token.model_quotas.get(&lower).copied().or_else(|| {
+                    let bare = crate::proxy::common::model_mapping::strip_tier_suffix(&lower);
+                    token.model_quotas.get(&bare).copied()
+                })
+            })
+    }
+
+    fn lookup_effective_quota(
+        token: &ProxyToken,
+        target_model: &str,
+        normalized_target: &str,
+    ) -> i32 {
+        Self::find_effective_quota(token, target_model, normalized_target).unwrap_or(0)
+    }
+
+    /// * `target_model` - 原始目标模型名
     /// * `normalized_target` - 归一化后的目标模型名
     /// * `quota_protection_enabled` - 是否启用配额保护
     fn select_with_p2c<'a>(
         &self,
         candidates: &'a [ProxyToken],
         attempted: &HashSet<String>,
+        target_model: &str,
         normalized_target: &str,
         quota_protection_enabled: bool,
     ) -> Option<&'a ProxyToken> {
@@ -2644,9 +2674,10 @@ impl TokenManager {
         // 被提前剔除的本就是不该参与并发调度的零配额账号。
         let has_positive_model_quota = available
             .iter()
-            .any(|t| t.model_quotas.get(normalized_target).copied().unwrap_or(0) > 0);
+            .any(|t| Self::lookup_effective_quota(t, target_model, normalized_target) > 0);
         if has_positive_model_quota {
-            available.retain(|t| t.model_quotas.get(normalized_target).copied().unwrap_or(0) > 0);
+            available
+                .retain(|t| Self::lookup_effective_quota(t, target_model, normalized_target) > 0);
         } else {
             // 全池候选账号确实均已配额耗尽：本地拦下，杜绝裸奔打爆 Google 429。
             tracing::warn!(
@@ -2727,15 +2758,9 @@ impl TokenManager {
         let c2 = available[pick2];
 
         // 目标模型配额提取
-        let q1 = c1
-            .model_quotas
-            .get(normalized_target)
-            .copied()
+        let q1 = Self::find_effective_quota(c1, target_model, normalized_target)
             .unwrap_or_else(|| c1.remaining_quota.unwrap_or(0));
-        let q2 = c2
-            .model_quotas
-            .get(normalized_target)
-            .copied()
+        let q2 = Self::find_effective_quota(c2, target_model, normalized_target)
             .unwrap_or_else(|| c2.remaining_quota.unwrap_or(0));
 
         // P2C 临期感知选择：若候选账号存在临期充足配额 (<= 24h 重置且 q > 10%)，优先抽中该临期账号防止配额作废
@@ -3254,8 +3279,8 @@ impl TokenManager {
             }
 
             // 提取目标模型配额
-            let quota_a = a.model_quotas.get(&normalized_target).copied().unwrap_or(0);
-            let quota_b = b.model_quotas.get(&normalized_target).copied().unwrap_or(0);
+            let quota_a = Self::lookup_effective_quota(a, target_model, &normalized_target);
+            let quota_b = Self::lookup_effective_quota(b, target_model, &normalized_target);
 
             // [NEW] Priority 0.5: 临期配额优先消耗 (Earliest Deadline First / Use-It-Or-Lose-It)
             // 针对 Gemini / Claude 账号池的核心经济学优化：
@@ -3319,7 +3344,7 @@ impl TokenManager {
                 .map(|t| format!(
                     "{}(quota={}%, reset={:?}, health={:.2})",
                     t.email,
-                    t.model_quotas.get(&normalized_target).copied().unwrap_or(0),
+                    Self::lookup_effective_quota(t, target_model, &normalized_target),
                     t.reset_time.map(|ts| {
                         let now = chrono::Utc::now().timestamp();
                         let diff_secs = ts - now;
@@ -3411,23 +3436,22 @@ impl TokenManager {
                                     .contains(&normalized_target);
 
                             // [FIX #3639] 检查优先账号的目标模型配额：多键容错匹配，防止因 key 差异误判满额
-                            let preferred_quota = preferred_token
-                                .model_quotas
-                                .get(&normalized_target)
-                                .or_else(|| preferred_token.model_quotas.get(target_model))
-                                .copied();
+                            let preferred_quota = Self::find_effective_quota(
+                                &preferred_token,
+                                target_model,
+                                &normalized_target,
+                            );
                             let has_zero_quota = preferred_quota.is_some_and(|q| q <= 0);
                             let has_healthy_alternative = tokens_snapshot.iter().any(|t| {
                                 t.account_id != preferred_token.account_id
                                     && !self
                                         .rate_limit_tracker
                                         .is_rate_limited(&t.account_id, Some(&normalized_target))
-                                    && t.model_quotas
-                                        .get(&normalized_target)
-                                        .or_else(|| t.model_quotas.get(target_model))
-                                        .copied()
-                                        .unwrap_or(0)
-                                        > 0
+                                    && Self::lookup_effective_quota(
+                                        t,
+                                        target_model,
+                                        &normalized_target,
+                                    ) > 0
                             });
 
                             if is_validation_blocked {
@@ -3555,23 +3579,19 @@ impl TokenManager {
                         let reset_sec = self
                             .rate_limit_tracker
                             .get_remaining_wait(&key, Some(&normalized_target));
-                        let bound_zero_quota = bound_token
-                            .model_quotas
-                            .get(&normalized_target)
-                            .or_else(|| bound_token.model_quotas.get(target_model))
-                            .copied()
-                            .is_some_and(|q| q <= 0);
+                        let bound_zero_quota = Self::find_effective_quota(
+                            bound_token,
+                            target_model,
+                            &normalized_target,
+                        )
+                        .is_some_and(|q| q <= 0);
                         let has_healthy_alternative = tokens_snapshot.iter().any(|t| {
                             t.account_id != bound_token.account_id
                                 && !attempted.contains(&t.account_id)
                                 && !self
                                     .rate_limit_tracker
                                     .is_rate_limited(&t.account_id, Some(&normalized_target))
-                                && t.model_quotas
-                                    .get(&normalized_target)
-                                    .or_else(|| t.model_quotas.get(target_model))
-                                    .copied()
-                                    .unwrap_or(0)
+                                && Self::lookup_effective_quota(t, target_model, &normalized_target)
                                     > 0
                         });
 
@@ -3658,12 +3678,12 @@ impl TokenManager {
                             {
                                 // 【修复】检查限流状态和配额保护，避免复用已被锁定的账号
                                 // 多键容错匹配：归一化 ID 与实际模型名不一致时不能当作满额
-                                let last_zero_quota = found
-                                    .model_quotas
-                                    .get(&normalized_target)
-                                    .or_else(|| found.model_quotas.get(target_model))
-                                    .copied()
-                                    .is_some_and(|q| q <= 0);
+                                let last_zero_quota = Self::find_effective_quota(
+                                    found,
+                                    target_model,
+                                    &normalized_target,
+                                )
+                                .is_some_and(|q| q <= 0);
                                 let has_healthy_alt = tokens_snapshot.iter().any(|t| {
                                     &t.account_id != account_id
                                         && !attempted.contains(&t.account_id)
@@ -3671,12 +3691,11 @@ impl TokenManager {
                                             &t.account_id,
                                             Some(&normalized_target),
                                         )
-                                        && t.model_quotas
-                                            .get(&normalized_target)
-                                            .or_else(|| t.model_quotas.get(target_model))
-                                            .copied()
-                                            .unwrap_or(0)
-                                            > 0
+                                        && Self::lookup_effective_quota(
+                                            t,
+                                            target_model,
+                                            &normalized_target,
+                                        ) > 0
                                 });
 
                                 let is_qos_jailed =
@@ -3742,6 +3761,7 @@ impl TokenManager {
                     if let Some(selected) = self.select_with_p2c(
                         &non_limited,
                         &attempted,
+                        target_model,
                         &normalized_target,
                         quota_protection_enabled,
                     ) {
@@ -3768,6 +3788,7 @@ impl TokenManager {
                 if let Some(selected) = self.select_with_p2c(
                     &non_limited,
                     &attempted,
+                    target_model,
                     &normalized_target,
                     quota_protection_enabled,
                 ) {
@@ -4765,7 +4786,8 @@ impl TokenManager {
             }
 
             // 4. 检查是否已知配额归零
-            if let Some(&quota) = token.model_quotas.get(&normalized_target) {
+            if let Some(quota) = Self::find_effective_quota(token, target_model, &normalized_target)
+            {
                 if quota <= 0 {
                     tracing::debug!(
                         "[Fallback Check] Account {} has 0% quota for model {}, skipping",
@@ -8391,7 +8413,13 @@ mod tests {
 
         // 运行多次确保选择高配额账号
         for _ in 0..10 {
-            let result = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet", false);
+            let result = manager.select_with_p2c(
+                &candidates,
+                &attempted,
+                "claude-sonnet",
+                "claude-sonnet",
+                false,
+            );
             assert!(result.is_some());
             // P2C 从两个候选中选择配额更高的
             // 由于只有两个候选，应该总是选择 high_quota
@@ -8414,7 +8442,13 @@ mod tests {
         let attempted: HashSet<String> = HashSet::new();
 
         for _ in 0..10 {
-            let result = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet", false);
+            let result = manager.select_with_p2c(
+                &candidates,
+                &attempted,
+                "claude-sonnet",
+                "claude-sonnet",
+                false,
+            );
             assert!(result.is_some());
             assert_eq!(
                 result.unwrap().email,
@@ -8434,19 +8468,19 @@ mod tests {
         let mut attempted = HashSet::new();
         for _ in 0..20 {
             let selected = manager
-                .select_with_p2c(&candidates, &attempted, "claude", true)
+                .select_with_p2c(&candidates, &attempted, "claude", "claude", true)
                 .unwrap();
             assert_eq!(selected.account_id, "high");
         }
         attempted.insert("high".to_string());
         let selected = manager
-            .select_with_p2c(&candidates, &attempted, "claude", true)
+            .select_with_p2c(&candidates, &attempted, "claude", "claude", true)
             .unwrap();
         assert_eq!(selected.account_id, "low");
         attempted.clear();
         candidates[1].protected_models.insert("claude".to_string());
         let selected = manager
-            .select_with_p2c(&candidates, &attempted, "claude", true)
+            .select_with_p2c(&candidates, &attempted, "claude", "claude", true)
             .unwrap();
         assert_eq!(selected.account_id, "low");
     }
@@ -8519,7 +8553,13 @@ mod tests {
         let mut attempted: HashSet<String> = HashSet::new();
         attempted.insert("a@test.com".to_string());
 
-        let result = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet", false);
+        let result = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet",
+            "claude-sonnet",
+            false,
+        );
         assert!(result.is_some());
         assert_eq!(result.unwrap().email, "b@test.com");
     }
@@ -8540,7 +8580,13 @@ mod tests {
         let candidates = vec![protected_account, normal_account];
         let attempted: HashSet<String> = HashSet::new();
 
-        let result = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet", true);
+        let result = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet",
+            "claude-sonnet",
+            true,
+        );
         assert!(result.is_some());
         assert_eq!(result.unwrap().email, "normal@test.com");
     }
@@ -8554,7 +8600,13 @@ mod tests {
         let candidates = vec![token];
         let attempted: HashSet<String> = HashSet::new();
 
-        let result = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet", false);
+        let result = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet",
+            "claude-sonnet",
+            false,
+        );
         assert!(result.is_some());
         assert_eq!(result.unwrap().email, "single@test.com");
     }
@@ -8567,7 +8619,13 @@ mod tests {
         let candidates: Vec<ProxyToken> = vec![];
         let attempted: HashSet<String> = HashSet::new();
 
-        let result = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet", false);
+        let result = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet",
+            "claude-sonnet",
+            false,
+        );
         assert!(result.is_none());
     }
 
@@ -8584,7 +8642,13 @@ mod tests {
         attempted.insert("a@test.com".to_string());
         attempted.insert("b@test.com".to_string());
 
-        let result = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet", false);
+        let result = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet",
+            "claude-sonnet",
+            false,
+        );
         assert!(result.is_none());
     }
 
@@ -9991,7 +10055,7 @@ mod tests {
         let attempted = HashSet::new();
 
         let selected = manager
-            .select_with_p2c(&candidates, &attempted, model, false)
+            .select_with_p2c(&candidates, &attempted, model, model, false)
             .expect("必须回退到有正配额的账号，而不是返回 None");
         assert_eq!(
             selected.account_id, "acc_healthy",
@@ -10005,7 +10069,7 @@ mod tests {
             .insert(model.to_string(), 80);
         let both_healthy = vec![boosted_with_quota, healthy.clone()];
         let selected2 = manager
-            .select_with_p2c(&both_healthy, &attempted, model, false)
+            .select_with_p2c(&both_healthy, &attempted, model, model, false)
             .expect("两者都有配额时应正常选中");
         assert_eq!(
             selected2.account_id, "acc_pedal_drained",
@@ -10020,7 +10084,7 @@ mod tests {
         let all_zero = vec![all_zero_a, all_zero_b];
         assert!(
             manager
-                .select_with_p2c(&all_zero, &attempted, model, false)
+                .select_with_p2c(&all_zero, &attempted, model, model, false)
                 .is_none(),
             "全池均为 0 配额时必须本地拦截"
         );
@@ -10043,7 +10107,13 @@ mod tests {
         let attempted = HashSet::new();
 
         // 场景 1: acc_priority_0 空闲 (in_flight == 0)，必须优先选 acc_priority_0
-        let sel1 = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet-4-6", false);
+        let sel1 = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            false,
+        );
         assert_eq!(sel1.unwrap().account_id, "acc_priority_0");
 
         // 场景 2: acc_priority_0 忙碌 (in_flight > 0)，acc_priority_1 空闲 (in_flight == 0)
@@ -10051,7 +10121,13 @@ mod tests {
         let guard_p0 = manager.acquire_in_flight("acc_priority_0");
         assert_eq!(manager.get_in_flight("acc_priority_0"), 1);
 
-        let sel2 = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet-4-6", false);
+        let sel2 = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            false,
+        );
         assert_eq!(sel2.unwrap().account_id, "acc_priority_1");
 
         // 场景 3: 两个账号都在忙，但 acc_priority_1 并发更高 (2)，acc_priority_0 并发为 1
@@ -10060,13 +10136,25 @@ mod tests {
         assert_eq!(manager.get_in_flight("acc_priority_1"), 2);
 
         // 此时 acc_priority_0 并发度更低 (1 < 2)，选并发度最低的 acc_priority_0
-        let sel3 = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet-4-6", false);
+        let sel3 = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            false,
+        );
         assert_eq!(sel3.unwrap().account_id, "acc_priority_0");
 
         drop(guard_p0);
         assert_eq!(manager.get_in_flight("acc_priority_0"), 0);
         // acc_priority_0 重新空闲后，再次选中 acc_priority_0
-        let sel4 = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet-4-6", false);
+        let sel4 = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            false,
+        );
         assert_eq!(sel4.unwrap().account_id, "acc_priority_0");
     }
 
@@ -10098,17 +10186,35 @@ mod tests {
         }
 
         // 场景 1: acc_0 空闲，选中 acc_0
-        let sel1 = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet-4-6", false);
+        let sel1 = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            false,
+        );
         assert_eq!(sel1.unwrap().account_id, "acc_0");
 
         // 场景 2: acc_0 忙碌，acc_1 空闲，此时使用的总账号数为 2 <= 上限 2，顺利外溢选中 acc_1
         let guard0 = manager.acquire_in_flight("acc_0");
-        let sel2 = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet-4-6", false);
+        let sel2 = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            false,
+        );
         assert_eq!(sel2.unwrap().account_id, "acc_1");
 
         // 场景 3: acc_0 忙碌，acc_1 也忙碌。虽然 acc_2 完全空闲，但因为设置了上限 2，严禁触碰第 3 个账号 acc_2！
         let guard1 = manager.acquire_in_flight("acc_1");
-        let sel3 = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet-4-6", false);
+        let sel3 = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            false,
+        );
         // 只能在 acc_0 和 acc_1 中选 (由于并发度相同 1==1，优先选高优先级 acc_0)
         assert_eq!(sel3.unwrap().account_id, "acc_0");
 
@@ -10118,7 +10224,13 @@ mod tests {
             cfg.max_spillover_accounts = 3;
             manager.update_sticky_config(cfg).await;
         }
-        let sel4 = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet-4-6", false);
+        let sel4 = manager.select_with_p2c(
+            &candidates,
+            &attempted,
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            false,
+        );
         assert_eq!(sel4.unwrap().account_id, "acc_2");
 
         drop(guard0);
@@ -10917,5 +11029,241 @@ mod tests {
         manager.remove_account(&no_quota_id);
         assert!(crate::modules::vertex::get_vertex_account_meta(&account_id).is_none());
         assert!(crate::modules::vertex::get_vertex_account_meta(&no_quota_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_vertex_sa_persisted_quota_routes_hydrogen_high_when_oauth_disabled() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let accounts_dir = temp_dir.path().join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let unique = uuid::Uuid::new_v4().to_string();
+        let oauth_disabled_id = format!("oauth-disabled-{}", unique);
+        let vertex_id = format!("vertex-persisted-{}", unique);
+
+        // 1. Disabled OAuth account (proxy_disabled=true in both entity and index)
+        let mut oauth_token = crate::models::TokenData::new(
+            "ya29.oauth-disabled-token".to_string(),
+            "1//04oauth_refresh".to_string(),
+            3600,
+            Some("oauth-disabled@example.com".to_string()),
+            Some("proj-oauth-disabled".to_string()),
+            None,
+            true,
+            None,
+        );
+        oauth_token.expiry_timestamp = now + 3600;
+        let mut oauth_acc = crate::models::Account::new(
+            oauth_disabled_id.clone(),
+            "oauth-disabled@example.com".to_string(),
+            oauth_token,
+        );
+        oauth_acc.proxy_disabled = true;
+        let mut oauth_quota = crate::models::QuotaData::new();
+        oauth_quota.subscription_tier = Some("PRO".to_string());
+        oauth_quota.add_model(crate::models::quota::ModelQuota {
+            name: "gemini-4-hydrogen-high".to_string(),
+            percentage: 100,
+            reset_time: String::new(),
+            display_name: None,
+            supports_images: None,
+            supports_thinking: Some(true),
+            thinking_budget: None,
+            recommended: None,
+            max_tokens: Some(1_048_576),
+            max_output_tokens: Some(262_144),
+            model: None,
+            supported_mime_types: None,
+        });
+        oauth_acc.quota = Some(oauth_quota);
+
+        // 2. Vertex SA account with stale persisted quota (non-empty models, missing hydrogen-high / limits)
+        let sa_creds = crate::modules::vertex::ServiceAccountCredentials {
+            cred_type: "service_account".to_string(),
+            project_id: "proj-vertex-hotfix".to_string(),
+            private_key_id: "key-hotfix".to_string(),
+            private_key:
+                "-----BEGIN PRIVATE KEY-----\nTEST_NOT_A_REAL_KEY\n-----END PRIVATE KEY-----\n"
+                    .to_string(),
+            client_email: "vertex-hotfix@proj-vertex-hotfix.iam.gserviceaccount.com".to_string(),
+            client_id: "987654321".to_string(),
+            token_uri: "https://oauth2.googleapis.com/token".to_string(),
+        };
+        let mut vertex_token = crate::models::TokenData::new(
+            "ya29.vertex-hotfix-access-token".to_string(),
+            String::new(),
+            3600,
+            Some("vertex-hotfix@proj-vertex-hotfix.iam.gserviceaccount.com".to_string()),
+            Some("proj-vertex-hotfix".to_string()),
+            None,
+            true,
+            None,
+        )
+        .with_oauth_client_key(Some("vertex_service_account".to_string()));
+        vertex_token.expiry_timestamp = now + 3600;
+        vertex_token.service_account = Some(sa_creds);
+        vertex_token.vertex_location = Some("global".to_string());
+
+        let mut vertex_acc = crate::models::Account::new(
+            vertex_id.clone(),
+            "vertex-hotfix@proj-vertex-hotfix.iam.gserviceaccount.com".to_string(),
+            vertex_token,
+        );
+        let mut stale_quota = crate::models::QuotaData::new();
+        stale_quota.subscription_tier = Some("ENTERPRISE".to_string());
+        stale_quota.add_model(crate::models::quota::ModelQuota {
+            name: "gemini-3-flash-preview".to_string(),
+            percentage: 100,
+            reset_time: String::new(),
+            display_name: None,
+            supports_images: None,
+            supports_thinking: Some(true),
+            thinking_budget: None,
+            recommended: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            model: None,
+            supported_mime_types: None,
+        });
+        vertex_acc.quota = Some(stale_quota);
+
+        std::fs::write(
+            accounts_dir.join(format!("{}.json", oauth_disabled_id)),
+            serde_json::to_string(&oauth_acc).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            accounts_dir.join(format!("{}.json", vertex_id)),
+            serde_json::to_string(&vertex_acc).unwrap(),
+        )
+        .unwrap();
+
+        let index_json = serde_json::json!({
+            "version": "2.0",
+            "accounts": [
+                {
+                    "id": oauth_disabled_id,
+                    "email": "oauth-disabled@example.com",
+                    "name": null,
+                    "disabled": false,
+                    "proxy_disabled": true,
+                    "created_at": now,
+                    "last_used": now
+                },
+                {
+                    "id": vertex_id,
+                    "email": "vertex-hotfix@proj-vertex-hotfix.iam.gserviceaccount.com",
+                    "name": null,
+                    "disabled": false,
+                    "proxy_disabled": false,
+                    "created_at": now,
+                    "last_used": now
+                }
+            ],
+            "current_account_id": vertex_id
+        });
+        std::fs::write(
+            temp_dir.path().join("accounts.json"),
+            index_json.to_string(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+        let loaded = manager.load_accounts().await.unwrap();
+        assert_eq!(
+            loaded, 1,
+            "Only the active Vertex SA account should load when OAuth account is proxy_disabled"
+        );
+
+        // Unconditional backfill must populate model_limits & quotas even when persisted quota.models was non-empty
+        assert_eq!(
+            manager.get_model_output_limit_for_account(&vertex_id, "gemini-4-hydrogen-high"),
+            Some(262_144)
+        );
+        assert_eq!(
+            manager.get_model_output_limit_for_account(&vertex_id, "gemini-4-carbon-high"),
+            Some(65_536)
+        );
+
+        assert_eq!(
+            crate::proxy::common::model_mapping::normalize_to_standard_id("gemini-4-hydrogen-high"),
+            Some("gemini-4-hydrogen".to_string())
+        );
+        assert_eq!(
+            crate::proxy::common::model_mapping::normalize_to_standard_id("gemini-4-carbon-high"),
+            Some("gemini-4-carbon".to_string())
+        );
+
+        let custom_mapping = tokio::sync::RwLock::new(HashMap::new());
+        assert!(matches!(
+            crate::proxy::common::model_gate::gate_inbound_model(
+                Some("gemini-4-hydrogen-high"),
+                &custom_mapping,
+                &manager,
+            )
+            .await,
+            crate::proxy::common::model_gate::ModelGate::Allow(_)
+        ));
+        assert!(matches!(
+            crate::proxy::common::model_gate::gate_inbound_model(
+                Some("gemini-4-carbon-high"),
+                &custom_mapping,
+                &manager,
+            )
+            .await,
+            crate::proxy::common::model_gate::ModelGate::Allow(_)
+        ));
+
+        assert!(
+            manager
+                .has_available_account("gemini", "gemini-4-hydrogen-high")
+                .await
+        );
+        let (access_token, project_id, _email, selected_id, _expires) = manager
+            .get_token("gemini", false, None, "gemini-4-hydrogen-high")
+            .await
+            .expect("Vertex SA must route gemini-4-hydrogen-high when OAuth is proxy_disabled");
+        assert_eq!(access_token, "ya29.vertex-hotfix-access-token");
+        assert_eq!(project_id, "proj-vertex-hotfix");
+        assert_eq!(selected_id, vertex_id);
+
+        let (_tok2, _proj2, _email2, selected_carbon, _exp2) = manager
+            .get_token("gemini", false, None, "gemini-4-carbon-high")
+            .await
+            .expect("Vertex SA must route gemini-4-carbon-high when OAuth is proxy_disabled");
+        assert_eq!(selected_carbon, vertex_id);
+
+        // Verify lookup_effective_quota fallback across normalized / mixed-case / tier-stripped keys
+        let mut tier_only =
+            create_test_token("tier-only@example.com", Some("ENTERPRISE"), 1.0, None, None);
+        tier_only.model_quotas.clear();
+        tier_only
+            .model_quotas
+            .insert("gemini-4-hydrogen-high".to_string(), 88);
+        assert_eq!(
+            TokenManager::lookup_effective_quota(
+                &tier_only,
+                "gemini-4-hydrogen-high",
+                "gemini-4-hydrogen"
+            ),
+            88
+        );
+        let mut base_only =
+            create_test_token("base-only@example.com", Some("ENTERPRISE"), 1.0, None, None);
+        base_only.model_quotas.clear();
+        base_only
+            .model_quotas
+            .insert("gemini-4-carbon".to_string(), 77);
+        assert_eq!(
+            TokenManager::lookup_effective_quota(
+                &base_only,
+                "Gemini-4-Carbon-High",
+                "gemini-4-carbon"
+            ),
+            77
+        );
+
+        manager.remove_account(&vertex_id);
     }
 }

@@ -5,6 +5,14 @@
             "thinking_budget": 10001,
             "is_thinking": true
         },
+        "gemini-4-hydrogen": {
+            "max_output_tokens": 262144,
+            "is_thinking": true
+        },
+        "gemini-4-carbon": {
+            "max_output_tokens": 262144,
+            "is_thinking": true
+        },
         "gemini-3.8-flash": {
             "max_output_tokens": 65536,
             "thinking_budget": 4000,

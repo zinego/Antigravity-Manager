@@ -1075,6 +1075,12 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     if lower.contains("argon") {
         return Some("gemini-4-argon".to_string());
     }
+    if lower.starts_with("gemini-4-hydrogen") {
+        return Some("gemini-4-hydrogen".to_string());
+    }
+    if lower.starts_with("gemini-4-carbon") {
+        return Some("gemini-4-carbon".to_string());
+    }
 
     // 1. Image resources must keep Flash image and Pro image in separate quota buckets.
     // The quota API exposes `gemini-3.1-flash-image` separately, so grouping it under
