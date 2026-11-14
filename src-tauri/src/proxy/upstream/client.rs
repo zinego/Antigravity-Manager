@@ -695,6 +695,22 @@ pub struct UpstreamClient {
     endpoint_health: EndpointHealthTracker,
 }
 
+struct VertexCallParams<'a> {
+    method: &'a str,
+    access_token: &'a str,
+    body: &'a Value,
+    query_string: Option<&'a str>,
+    extra_headers: &'a std::collections::HashMap<String, String>,
+    account_id: Option<&'a str>,
+    vertex_meta: &'a crate::modules::vertex::VertexAccountMeta,
+}
+
+struct VertexPreparedRequest {
+    vertex_model: String,
+    vertex_url: String,
+    vertex_body: Value,
+}
+
 impl UpstreamClient {
     pub fn new(
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
@@ -1346,6 +1362,251 @@ impl UpstreamClient {
         }
     }
 
+    fn strip_internal_vertex_model_field(body: &mut Value) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("x-agm-vertex-model");
+        }
+        if let Some(inner) = body.get_mut("request").and_then(|v| v.as_object_mut()) {
+            inner.remove("x-agm-vertex-model");
+        }
+    }
+
+    fn prepare_vertex_dispatch(
+        method: &str,
+        body: &Value,
+        query_string: Option<&str>,
+        extra_headers: Option<&std::collections::HashMap<String, String>>,
+        account_id: Option<&str>,
+        vertex_meta: &crate::modules::vertex::VertexAccountMeta,
+    ) -> Result<VertexPreparedRequest, String> {
+        let raw_model = extra_headers
+            .and_then(|hdrs| {
+                hdrs.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("x-agm-vertex-model"))
+                    .map(|(_, v)| v.as_str())
+            })
+            .or_else(|| body.get("x-agm-vertex-model").and_then(|v| v.as_str()))
+            .or_else(|| {
+                body.get("request")
+                    .and_then(|r| r.get("x-agm-vertex-model"))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| body.get("model").and_then(|v| v.as_str()))
+            .or_else(|| {
+                body.get("request")
+                    .and_then(|r| r.get("model"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
+
+        if raw_model.trim().is_empty()
+            || !crate::modules::vertex::is_vertex_supported_model(raw_model)
+        {
+            return Err(format!(
+                "Vertex SA account {:?} does not support model '{}'",
+                account_id, raw_model
+            ));
+        }
+
+        let vertex_model = crate::modules::vertex::resolve_vertex_model_id(raw_model);
+        let vertex_url = crate::modules::vertex::build_vertex_endpoint_url(
+            &vertex_meta.project_id,
+            &vertex_meta.location,
+            &vertex_model,
+            method,
+            query_string,
+        );
+        let vertex_body = crate::modules::vertex::prepare_vertex_request_body(body, method);
+
+        Ok(VertexPreparedRequest {
+            vertex_model,
+            vertex_url,
+            vertex_body,
+        })
+    }
+
+    async fn call_vertex_ai_direct(
+        &self,
+        params: VertexCallParams<'_>,
+    ) -> Result<UpstreamCallResult, String> {
+        let prepared = Self::prepare_vertex_dispatch(
+            params.method,
+            params.body,
+            params.query_string,
+            Some(params.extra_headers),
+            params.account_id,
+            params.vertex_meta,
+        )?;
+        self.send_vertex_direct_request(&params, &prepared).await
+    }
+
+    async fn send_vertex_direct_request(
+        &self,
+        params: &VertexCallParams<'_>,
+        prepared: &VertexPreparedRequest,
+    ) -> Result<UpstreamCallResult, String> {
+        let payload_tokens =
+            crate::proxy::pipeline::estimator::estimate_tokens(&prepared.vertex_body);
+        if payload_tokens > 0 {
+            crate::proxy::pipeline::budget::set_estimated_tokens(payload_tokens);
+        }
+
+        let client = self.get_client(params.account_id).await;
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        let mut auth_val =
+            header::HeaderValue::from_str(&format!("Bearer {}", params.access_token))
+                .map_err(|e| e.to_string())?;
+        auth_val.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, auth_val);
+
+        let is_sse = params.method == "streamGenerateContent"
+            || params.query_string.is_some_and(|q| q.contains("alt=sse"));
+        if is_sse {
+            headers.insert(
+                header::ACCEPT,
+                header::HeaderValue::from_static("text/event-stream"),
+            );
+        }
+
+        for (k, v) in params.extra_headers {
+            let k_lower = k.to_ascii_lowercase();
+            if k_lower == "x-agm-vertex-model"
+                || k_lower == "user-agent"
+                || k_lower == "x-session-id"
+                || k_lower == "x-client-name"
+                || k_lower == "x-client-version"
+                || k_lower == "x-machine-id"
+                || k_lower == "x-vscode-sessionid"
+                || k_lower == "x-goog-user-project"
+                || k_lower == "anthropic-beta"
+                || k_lower == "authorization"
+                || k_lower == "content-type"
+                || k_lower == "host"
+                || k_lower.starts_with("x-jeikcode")
+            {
+                continue;
+            }
+            if let Ok(hk) = header::HeaderName::from_bytes(k.as_bytes()) {
+                if let Ok(hv) = header::HeaderValue::from_str(v) {
+                    headers.insert(hk, hv);
+                }
+            }
+        }
+
+        let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.try_with(|holder| {
+            let pairs: Vec<(&str, &str)> = headers
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str(), s)))
+                .collect();
+            holder.set_headers_json(crate::proxy::payload_audit::header_pairs_to_redacted_json(
+                pairs,
+            ));
+        });
+
+        let is_image_gen = params
+            .body
+            .get("requestType")
+            .and_then(|v| v.as_str())
+            .is_some_and(|rt| rt == "image_gen")
+            || prepared.vertex_model.contains("image")
+            || prepared.vertex_model.starts_with("imagen-")
+            || prepared
+                .vertex_body
+                .get("generationConfig")
+                .and_then(|g| g.get("imageConfig"))
+                .is_some();
+        let body_bytes = serde_json::to_vec(&prepared.vertex_body).map_err(|e| e.to_string())?;
+        if let Err(call_no) =
+            crate::proxy::pipeline::budget::register_upstream_call(body_bytes.len())
+        {
+            return Err(format!(
+                "{}Cross-account replay cap reached for large body (call #{}, limit={}, body_len={})",
+                REPLAY_CAP_TERMINAL_MARKER,
+                call_no,
+                crate::proxy::pipeline::budget::MAX_LARGE_BODY_UPSTREAM_CALLS,
+                body_bytes.len()
+            ));
+        }
+
+        let media_kind =
+            detect_payload_media_kind(&prepared.vertex_body, params.method, is_image_gen);
+        let upload_cfg = crate::proxy::get_upload_timeout_config();
+        let timeout_plan = Self::plan_upstream_timeouts(media_kind, body_bytes.len(), &upload_cfg);
+        if crate::proxy::pipeline::budget::exhausted() {
+            return Err(format!(
+                "{}Gateway global request budget exhausted before Vertex AI call (method={}, body_len={})",
+                GATEWAY_BUDGET_TERMINAL_MARKER,
+                params.method,
+                body_bytes.len()
+            ));
+        }
+        let total_budget_secs =
+            crate::proxy::pipeline::budget::clamp_budget_secs(timeout_plan.total_budget_secs);
+
+        crate::proxy::stage_trace::StageTrace::mark_current(
+            "upstream_attempt",
+            format!(
+                "vertex_host={} model={}",
+                params.vertex_meta.location, prepared.vertex_model
+            ),
+        );
+
+        let attempt_start = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(total_budget_secs.max(5)),
+            client
+                .post(&prepared.vertex_url)
+                .headers(headers)
+                .body(body_bytes)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "Vertex AI request timed out after {}s ({})",
+                total_budget_secs.max(5),
+                prepared.vertex_url
+            )
+        })?
+        .map_err(|e| format!("Vertex AI request to {} failed: {}", prepared.vertex_url, e))?;
+
+        let duration_s = attempt_start.elapsed().as_secs_f64();
+        let status = response.status();
+        crate::proxy::stage_trace::StageTrace::mark_current(
+            "upstream_headers",
+            format!(
+                "status={} vertex_location={} elapsed={:.1}s",
+                status.as_u16(),
+                params.vertex_meta.location,
+                duration_s
+            ),
+        );
+
+        // Preserve non-2xx HTTP responses inside UpstreamCallResult so downstream handlers
+        // can run 401 refresh, 429 rate-limit backoff, 400 auto-heal, and error mapping.
+        Ok(UpstreamCallResult {
+            response,
+            fallback_attempts: vec![FallbackAttemptLog {
+                endpoint_name: format!("vertex:{}", params.vertex_meta.location),
+                endpoint_url: prepared.vertex_url.clone(),
+                status: Some(status.as_u16()),
+                duration_s,
+                switch_delay_s: None,
+                error: if status.is_success() {
+                    String::new()
+                } else {
+                    format!("HTTP {}", status)
+                },
+                is_effective: status.is_success(),
+            }],
+            effective_attempt_start: attempt_start,
+        })
+    }
+
     /// `call_v1_internal_with_headers` 的实际实现（已在外层完成请求级预算夹取）
     async fn call_v1_internal_with_headers_inner(
         &self,
@@ -1370,6 +1631,23 @@ impl UpstreamClient {
             );
             crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut body);
         }
+        if let Some(vertex_meta) =
+            account_id.and_then(crate::modules::vertex::get_vertex_account_meta)
+        {
+            return self
+                .call_vertex_ai_direct(VertexCallParams {
+                    method,
+                    access_token,
+                    body: &body,
+                    query_string,
+                    extra_headers: &extra_headers,
+                    account_id,
+                    vertex_meta: &vertex_meta,
+                })
+                .await;
+        }
+        Self::strip_internal_vertex_model_field(&mut body);
+
         if method == "countTokens" {
             crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
         } else {
@@ -1426,7 +1704,8 @@ impl UpstreamClient {
         // 严格过滤客户端特征伪头，确保出站请求头 100% 对齐官方 Antigravity Hub
         for (k, v) in extra_headers {
             let k_lower = k.to_ascii_lowercase();
-            if k_lower == "user-agent"
+            if k_lower == "x-agm-vertex-model"
+                || k_lower == "user-agent"
                 || k_lower == "x-session-id"
                 || k_lower == "x-client-name"
                 || k_lower == "x-client-version"
@@ -2077,6 +2356,43 @@ impl UpstreamClient {
         account_id: Option<&str>,
         timeout_secs: u64,
     ) -> Result<Value, String> {
+        if let Some(vertex_meta) =
+            account_id.and_then(crate::modules::vertex::get_vertex_account_meta)
+        {
+            let prepared =
+                Self::prepare_vertex_dispatch(method, &body, None, None, account_id, &vertex_meta)?;
+            let client = self.get_client(account_id).await;
+            let response = client
+                .post(&prepared.vertex_url)
+                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Content-Type", "application/json")
+                .timeout(Duration::from_secs(timeout_secs))
+                .json(&prepared.vertex_body)
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Vertex AI auxiliary request to {} failed: {}",
+                        prepared.vertex_url, e
+                    )
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                let text = response.text().await.unwrap_or_default();
+                return Err(format!(
+                    "{} returned {}: {}",
+                    prepared.vertex_url, status, text
+                ));
+            }
+            return response.json().await.map_err(|e| {
+                format!(
+                    "failed to parse Vertex AI response from {}: {}",
+                    prepared.vertex_url, e
+                )
+            });
+        }
+        Self::strip_internal_vertex_model_field(&mut body);
+
         if method == "countTokens" {
             crate::proxy::pipeline::InboundThinkingPipeline::align_count_tokens_envelope(&mut body);
         } else {
@@ -2732,5 +3048,142 @@ mod tests {
         record_upload_throughput_sample(4 * 1024 * 1024, std::time::Duration::from_secs(2));
         assert!(current_upload_throughput_bps().is_some());
         reset_upload_throughput_estimate();
+    }
+
+    #[test]
+    fn test_prepare_vertex_dispatch_honors_and_strips_x_agm_vertex_model() {
+        let mut extra_headers = std::collections::HashMap::new();
+        extra_headers.insert(
+            "X-AGM-Vertex-Model".to_string(),
+            "gemini-3-flash".to_string(),
+        );
+        let meta = crate::modules::vertex::VertexAccountMeta {
+            project_id: "proj-test".to_string(),
+            location: "global".to_string(),
+        };
+        let body = serde_json::json!({
+            "project": "old-proj",
+            "model": "should-be-overridden",
+            "x-agm-vertex-model": "should-be-stripped",
+            "request": {
+                "x-agm-vertex-model": "should-also-be-stripped",
+                "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+                "safetySettings": [],
+                "generationConfig": { "temperature": 0.2 }
+            }
+        });
+
+        let prepared = UpstreamClient::prepare_vertex_dispatch(
+            "countTokens",
+            &body,
+            None,
+            Some(&extra_headers),
+            Some("acc-1"),
+            &meta,
+        )
+        .expect("dispatch should succeed");
+        assert_eq!(prepared.vertex_model, "gemini-3-flash-preview");
+        assert!(prepared
+            .vertex_url
+            .ends_with("/publishers/google/models/gemini-3-flash-preview:countTokens"));
+        assert!(prepared.vertex_body.get("x-agm-vertex-model").is_none());
+        assert!(prepared.vertex_body.get("safetySettings").is_none());
+        assert!(prepared.vertex_body.get("generationConfig").is_none());
+
+        // Without extra_headers, auxiliary/body calls should honor body["x-agm-vertex-model"] and strip it
+        let aux_body = serde_json::json!({
+            "x-agm-vertex-model": "gemini-3.5-flash",
+            "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }]
+        });
+        let aux_prepared = UpstreamClient::prepare_vertex_dispatch(
+            "generateContent",
+            &aux_body,
+            None,
+            None,
+            Some("acc-1"),
+            &meta,
+        )
+        .expect("aux dispatch should succeed");
+        assert_eq!(aux_prepared.vertex_model, "gemini-3.5-flash");
+        assert!(aux_prepared.vertex_body.get("x-agm-vertex-model").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_vertex_direct_preserves_non_2xx_response_in_upstream_call_result() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let captured_srv = captured.clone();
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = socket.read(&mut buf).await.unwrap();
+            *captured_srv.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            let err_json = r#"{"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#;
+            let resp = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                err_json.len(),
+                err_json
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let upstream = UpstreamClient::new(None, None);
+        let meta = crate::modules::vertex::VertexAccountMeta {
+            project_id: "proj-test".to_string(),
+            location: "global".to_string(),
+        };
+        let mut extra_headers = std::collections::HashMap::new();
+        extra_headers.insert(
+            "x-agm-vertex-model".to_string(),
+            "gemini-3.5-flash".to_string(),
+        );
+        extra_headers.insert("x-goog-user-project".to_string(), "bad-project".to_string());
+        let body = serde_json::json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "ping" }] }]
+        });
+        let prepared = VertexPreparedRequest {
+            vertex_model: "gemini-3.5-flash".to_string(),
+            vertex_url: format!("http://{}/v1beta1/projects/proj-test/locations/global/publishers/google/models/gemini-3.5-flash:generateContent", addr),
+            vertex_body: crate::modules::vertex::prepare_vertex_request_body(&body, "generateContent"),
+        };
+        let params = VertexCallParams {
+            method: "generateContent",
+            access_token: "ya29.test-token",
+            body: &body,
+            query_string: None,
+            extra_headers: &extra_headers,
+            account_id: Some("vertex-acc-1"),
+            vertex_meta: &meta,
+        };
+
+        let result = upstream
+            .send_vertex_direct_request(&params, &prepared)
+            .await
+            .expect("HTTP 429 must be returned as Ok(UpstreamCallResult), not Err");
+        assert_eq!(result.response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(result.fallback_attempts.len(), 1);
+        assert_eq!(result.fallback_attempts[0].status, Some(429));
+        assert!(!result.fallback_attempts[0].is_effective);
+
+        let body_text = result.response.text().await.unwrap();
+        assert!(body_text.contains("RESOURCE_EXHAUSTED"));
+
+        server_task.await.unwrap();
+        let req_raw = captured.lock().await;
+        assert!(
+            !req_raw.to_ascii_lowercase().contains("x-agm-vertex-model"),
+            "Internal routing header must never be sent upstream: {}",
+            *req_raw
+        );
+        assert!(
+            !req_raw.to_ascii_lowercase().contains("x-goog-user-project"),
+            "x-goog-user-project must be stripped for Vertex AI: {}",
+            *req_raw
+        );
     }
 }

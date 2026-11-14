@@ -24,6 +24,10 @@ pub struct TokenData {
     pub is_gcp_tos: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_account: Option<crate::modules::vertex::ServiceAccountCredentials>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertex_location: Option<String>,
 }
 
 impl TokenData {
@@ -50,11 +54,17 @@ impl TokenData {
             session_id,
             is_gcp_tos,
             id_token,
+            service_account: None,
+            vertex_location: None,
         }
     }
 
     pub fn with_oauth_client_key(mut self, oauth_client_key: Option<String>) -> Self {
         self.oauth_client_key = oauth_client_key;
         self
+    }
+
+    pub fn is_vertex_service_account(&self) -> bool {
+        self.service_account.is_some()
     }
 }

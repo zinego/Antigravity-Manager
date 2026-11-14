@@ -180,10 +180,12 @@ fn parse_sse_stream(raw: &str) -> (String, String) {
 
         // 尝试解析 JSON
         if let Ok(parsed) = serde_json::from_str::<Value>(json_str) {
-            // Gemini/v1internal 格式: response.candidates[0].content.parts[0]
+            // Gemini/v1internal 格式: response.candidates[0].content.parts[0]；
+            // Vertex AI / 标准 Gemini 直连格式: candidates[0].content.parts[0]
             if let Some(candidates) = parsed
                 .get("response")
                 .and_then(|r| r.get("candidates"))
+                .or_else(|| parsed.get("candidates"))
                 .and_then(|c| c.as_array())
             {
                 for candidate in candidates {

@@ -145,6 +145,14 @@ impl Account {
         self.last_used = chrono::Utc::now().timestamp();
     }
 
+    pub fn redacted_for_ipc(&self) -> Self {
+        let mut cloned = self.clone();
+        if let Some(sa) = cloned.token.service_account.as_ref() {
+            cloned.token.service_account = Some(sa.redacted());
+        }
+        cloned
+    }
+
     pub fn update_quota(&mut self, mut quota: QuotaData) {
         // A failed/partial summary is not evidence that a previously observed bucket recovered.
         if let Some(existing) = &self.quota {

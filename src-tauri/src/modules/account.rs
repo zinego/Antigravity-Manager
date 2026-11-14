@@ -1738,6 +1738,21 @@ pub async fn auto_fetch_account_project_id(account_id: &str) -> Result<String, S
         let _ = save_account(&account);
     }
 
+    if let Some(sa) = account.token.service_account.as_ref() {
+        let pid = account
+            .token
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(sa.project_id.as_str())
+            .to_string();
+        if !pid.is_empty() {
+            update_account_project_id(account_id, Some(pid.clone()))?;
+            return Ok(pid);
+        }
+    }
+
     match crate::proxy::project_resolver::fetch_project_id_for_account(
         &token.access_token,
         Some(account_id),
@@ -1826,7 +1841,6 @@ pub fn upsert_account(
     let mut index = load_account_index()?;
 
     let norm_email = email.trim().to_lowercase();
-    let norm_rt = token.refresh_token.trim().to_string();
 
     // 幂等查找：按邮箱（忽略大小写）或凭据查找已有账号 ID
     let existing_account_id = index
@@ -1841,11 +1855,13 @@ pub fn upsert_account(
             Ok(mut account) => {
                 let old_access_token = account.token.access_token.clone();
                 let old_refresh_token = account.token.refresh_token.clone();
+                let old_service_account = account.token.service_account.clone();
                 account.token = token;
                 account.name = name.clone();
                 if account.disabled
                     && (account.token.refresh_token != old_refresh_token
-                        || account.token.access_token != old_access_token)
+                        || account.token.access_token != old_access_token
+                        || account.token.service_account != old_service_account)
                 {
                     account.disabled = false;
                     account.disabled_reason = None;
@@ -3192,6 +3208,51 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
     use crate::error::AppError;
     use crate::modules::oauth;
 
+    if let Some(sa) = account.token.service_account.clone() {
+        let (access_token, expires_in) =
+            match crate::modules::vertex::exchange_service_account_token(&sa, Some(&account.id))
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    if e.contains("invalid_grant") {
+                        modules::logger::log_error(&format!(
+                            "Disabling Vertex SA account {} due to invalid_grant during token refresh (quota check)",
+                            account.email
+                        ));
+                        account.disabled = true;
+                        account.disabled_at = Some(chrono::Utc::now().timestamp());
+                        account.disabled_reason = Some(format!("invalid_grant: {}", e));
+                        let _ = save_account(account);
+                        crate::proxy::server::trigger_account_reload(&account.id);
+                    }
+                    return Err(AppError::OAuth(e));
+                }
+            };
+
+        account.token.access_token = access_token;
+        account.token.expires_in = expires_in;
+        account.token.expiry_timestamp = chrono::Utc::now().timestamp() + expires_in;
+        account.token.token_type = "Bearer".to_string();
+        if account
+            .token
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            account.token.project_id = Some(sa.project_id);
+        }
+        if account.disabled {
+            account.disabled = false;
+            account.disabled_at = None;
+            account.disabled_reason = None;
+        }
+        let _ = save_account(account);
+        return Ok(crate::modules::vertex::build_synthetic_vertex_quota());
+    }
+
     // 1. Time-based check - ensure Token is valid first
     let token = match oauth::ensure_fresh_token(&account.token, Some(&account.id)).await {
         Ok(t) => t,
@@ -3646,6 +3707,14 @@ pub fn parse_import_entries_from_str(content: &str) -> Vec<crate::models::Import
     let mut entries = Vec::new();
 
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Ok(Some(parsed)) = crate::modules::vertex::parse_vertex_credentials(content) {
+            entries.push(crate::models::ImportAccountEntry {
+                email: Some(parsed.service_account.client_email),
+                refresh_token: content.trim().to_string(),
+            });
+            return entries;
+        }
+
         let mut raw_items = Vec::new();
 
         if let Some(arr) = val.as_array() {
@@ -3661,6 +3730,20 @@ pub fn parse_import_entries_from_str(content: &str) -> Vec<crate::models::Import
         }
 
         for item in raw_items {
+            if item.is_object() {
+                if let Ok(item_json) = serde_json::to_string(&item) {
+                    if let Ok(Some(parsed)) =
+                        crate::modules::vertex::parse_vertex_credentials(&item_json)
+                    {
+                        entries.push(crate::models::ImportAccountEntry {
+                            email: Some(parsed.service_account.client_email),
+                            refresh_token: item_json,
+                        });
+                        continue;
+                    }
+                }
+            }
+
             let email = item
                 .get("email")
                 .and_then(|v| v.as_str())
@@ -3678,7 +3761,12 @@ pub fn parse_import_entries_from_str(content: &str) -> Vec<crate::models::Import
                 .map(|s| s.trim().to_string());
 
             if let Some(refresh_token) = rt {
-                if !refresh_token.is_empty() && refresh_token.starts_with("1//") {
+                let is_vertex_json = matches!(
+                    crate::modules::vertex::parse_vertex_credentials(&refresh_token),
+                    Ok(Some(_))
+                );
+                if !refresh_token.is_empty() && (refresh_token.starts_with("1//") || is_vertex_json)
+                {
                     entries.push(crate::models::ImportAccountEntry {
                         email,
                         refresh_token,
@@ -3765,6 +3853,77 @@ pub async fn batch_import_accounts_logic(
                 let import_op = async {
                     if rt.is_empty() {
                         return Err("Refresh token is empty".to_string());
+                    }
+
+                    if let Some(parsed) = crate::modules::vertex::parse_vertex_credentials(&rt)? {
+                        let real_email = parsed.service_account.client_email.clone();
+                        let norm_email = real_email.to_lowercase();
+                        let existing_id = existing_email_map.get(&norm_email).map(String::as_str);
+                        let (access_token, expires_in) =
+                            crate::modules::vertex::exchange_service_account_token(
+                                &parsed.service_account,
+                                existing_id,
+                            )
+                            .await?;
+                        let project_id = parsed.service_account.project_id.clone();
+                        let account_id = existing_id
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                        let mut token_data = crate::models::TokenData::new(
+                            access_token,
+                            String::new(),
+                            expires_in,
+                            Some(real_email.clone()),
+                            Some(project_id.clone()),
+                            None,
+                            true,
+                            None,
+                        )
+                        .with_oauth_client_key(Some(
+                            crate::modules::vertex::VERTEX_OAUTH_CLIENT_KEY.to_string(),
+                        ));
+                        token_data.service_account = Some(parsed.service_account);
+                        token_data.vertex_location = Some(parsed.location);
+
+                        let display_name = Some(format!("Vertex ({})", project_id));
+                        let mut account = if let Ok(mut existing_acc) = load_account(&account_id) {
+                            let old_sa = existing_acc.token.service_account.clone();
+                            existing_acc.token = token_data;
+                            existing_acc.name = display_name;
+                            existing_acc.email = real_email.clone();
+                            if existing_acc.disabled && existing_acc.token.service_account != old_sa
+                            {
+                                existing_acc.disabled = false;
+                                existing_acc.disabled_reason = None;
+                                existing_acc.disabled_at = None;
+                            }
+                            existing_acc.update_last_used();
+                            existing_acc
+                        } else {
+                            let mut new_acc = crate::models::Account::new(
+                                account_id.clone(),
+                                real_email.clone(),
+                                token_data,
+                            );
+                            new_acc.name = display_name;
+                            new_acc
+                        };
+                        account
+                            .update_quota(crate::modules::vertex::build_synthetic_vertex_quota());
+                        save_account(&account)?;
+
+                        let summary = crate::models::AccountSummary {
+                            id: account.id.clone(),
+                            email: account.email.clone(),
+                            name: account.name.clone(),
+                            disabled: account.disabled,
+                            proxy_disabled: account.proxy_disabled,
+                            protected_models: account.protected_models.clone(),
+                            created_at: account.created_at,
+                            last_used: account.last_used,
+                        };
+                        return Ok((account, summary));
                     }
 
                     // 科学防风控微抖动：注入 30ms ~ 90ms 动态散列延迟，打散请求并发时序，杜绝同一毫秒齐射 Google

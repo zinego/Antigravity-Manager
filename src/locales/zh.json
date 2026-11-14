@@ -418,7 +418,7 @@
             "title": "添加新账号",
             "tabs": {
                 "oauth": "OAuth 授权",
-                "token": "Refresh Token",
+                "token": "Token / JSON",
                 "import": "从数据库导入"
             },
             "oauth": {
@@ -444,10 +444,10 @@
                 "manual_submitted": "认证码已提交，后台处理中..."
             },
             "token": {
-                "label": "Refresh Token",
-                "placeholder": "在此处粘贴您的 Refresh Token (支持批量)\n\n支持格式:\n1. 单个 Token (1//...)\n2. JSON 数组 (含 refresh_token 字段)\n3. 任意包含 Token 的文本 (自动提取)",
-                "hint": "提示: 支持一次性粘贴多个 Token 或 JSON 数组，系统将自动识别并批量导入。",
-                "error_token": "请填写 Refresh Token",
+                "label": "Refresh Token / Service Account JSON",
+                "placeholder": "在此处粘贴 Refresh Token 或 Google Cloud Service Account JSON (支持批量)\n\n支持格式:\n1. 单个 Token (1//...)\n2. Service Account JSON ({\"type\": \"service_account\", ...} 或 Vertex 包装格式)\n3. JSON 数组 (含 refresh_token 或 Service Account 对象)\n4. 任意包含 Token 的文本 (自动提取)",
+                "hint": "提示: 支持粘贴多个 Refresh Token (1//...)、Google Cloud Service Account JSON (\"type\": \"service_account\") 或混合 JSON 数组，系统将自动识别并批量导入。",
+                "error_token": "请填写 Refresh Token 或有效的 Service Account JSON",
                 "batch_progress": "正在导入第 {{current}}/{{total}} 个账户...",
                 "batch_success": "成功导入 {{count}} 个账户",
                 "batch_partial": "导入完成: {{success}} 个成功, {{fail}} 个失败",

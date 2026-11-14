@@ -1508,6 +1508,8 @@ pub async fn execute_count_tokens(
     });
 
     // 4. 调用上游 v1internal:countTokens
+    let mut count_headers = std::collections::HashMap::new();
+    count_headers.insert("x-agm-vertex-model".to_string(), config.final_model.clone());
     let call_result = match state
         .upstream
         .call_v1_internal_with_headers(
@@ -1515,7 +1517,7 @@ pub async fn execute_count_tokens(
             &access_token,
             wrapped_body,
             None,
-            std::collections::HashMap::new(),
+            count_headers,
             Some(account_id.as_str()),
         )
         .await

@@ -827,6 +827,8 @@ mod tests {
             model_limits: HashMap::new(),
             available_models: HashSet::new(),
             model_metadata: HashMap::new(),
+            is_vertex_sa: false,
+            vertex_location: None,
         }
     }
 

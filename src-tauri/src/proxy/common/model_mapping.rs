@@ -336,11 +336,16 @@ pub async fn get_all_dynamic_models(
     let mut model_ids = HashSet::new();
     let mut custom_keys = HashSet::new();
 
+    let has_vertex_sa = token_manager.is_some_and(|tm| tm.has_vertex_accounts());
+
     // 1. 获取所有账号从官方 fetchAvailableModels 接口汇聚而来的真实可用模型并集
     // [2026-10-29] 严格取官方可用集合（不含内部保护桶名，也不含字典残留）
     if let Some(tm) = token_manager {
         for dynamic_model in tm.get_all_available_models() {
-            if is_model_compliant_with_baseline(&dynamic_model) {
+            if is_model_compliant_with_baseline(&dynamic_model)
+                || (has_vertex_sa
+                    && crate::modules::vertex::is_vertex_model_id_exposed(&dynamic_model))
+            {
                 model_ids.insert(dynamic_model);
             }
         }
@@ -388,7 +393,11 @@ pub async fn get_all_dynamic_models(
             "-thinking",
         ] {
             if let Some(base) = id.strip_suffix(suffix) {
-                if !base.is_empty() && is_model_compliant_with_baseline(base) {
+                if !base.is_empty()
+                    && (is_model_compliant_with_baseline(base)
+                        || (has_vertex_sa
+                            && crate::modules::vertex::is_vertex_model_id_exposed(base)))
+                {
                     derived_bare_models.insert(base.to_string());
                 }
             }
@@ -419,7 +428,11 @@ pub async fn get_all_dynamic_models(
     // 5. 应用官方基准线过滤，彻底剔除已淘汰的旧版模型与内部虚拟 ID
     let mut sorted_ids: Vec<_> = model_ids
         .into_iter()
-        .filter(|id| custom_keys.contains(id) || is_model_compliant_with_baseline(id))
+        .filter(|id| {
+            custom_keys.contains(id)
+                || is_model_compliant_with_baseline(id)
+                || (has_vertex_sa && crate::modules::vertex::is_vertex_model_id_exposed(id))
+        })
         .collect();
     sorted_ids.sort();
     sorted_ids
@@ -496,6 +509,8 @@ pub async fn get_all_dynamic_models_metadata(
     token_manager: Option<&crate::proxy::token_manager::TokenManager>,
     only_raw_quota_models: bool,
 ) -> std::collections::HashMap<String, crate::models::quota::ModelListingMeta> {
+    let has_vertex_sa = token_manager.is_some_and(|tm| tm.has_vertex_accounts());
+
     let mut meta_map = if let Some(tm) = token_manager {
         tm.get_all_model_metadata()
     } else {
@@ -523,7 +538,11 @@ pub async fn get_all_dynamic_models_metadata(
             "-thinking",
         ] {
             if let Some(base) = name.strip_suffix(suffix) {
-                if !base.is_empty() && is_model_compliant_with_baseline(base) {
+                if !base.is_empty()
+                    && (is_model_compliant_with_baseline(base)
+                        || (has_vertex_sa
+                            && crate::modules::vertex::is_vertex_model_id_exposed(base)))
+                {
                     let mut m = meta.clone();
                     if let Some(ref dn) = m.display_name {
                         m.display_name = Some(clean_tier_from_display_name(dn));
@@ -599,6 +618,7 @@ pub async fn get_all_dynamic_models_metadata(
                 exposed && !name.contains('*') && !target.starts_with("auto:")
             } else {
                 is_model_compliant_with_baseline(name)
+                    || (has_vertex_sa && crate::modules::vertex::is_vertex_model_id_exposed(name))
             }
         });
     }

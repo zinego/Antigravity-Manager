@@ -59,6 +59,8 @@ fn create_test_token(
         model_limits: std::collections::HashMap::new(),
         available_models: supported_models.iter().map(|s| s.to_lowercase()).collect(),
         model_metadata: std::collections::HashMap::new(),
+        is_vertex_sa: false,
+        vertex_location: None,
     }
 }
 

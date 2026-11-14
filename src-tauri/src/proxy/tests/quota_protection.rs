@@ -44,6 +44,8 @@ mod tests {
             model_limits: std::collections::HashMap::new(),
             available_models: std::collections::HashSet::new(),
             model_metadata: std::collections::HashMap::new(),
+            is_vertex_sa: false,
+            vertex_location: None,
         }
     }
 
@@ -1115,6 +1117,8 @@ mod tests {
             model_limits: std::collections::HashMap::new(),
             available_models: std::collections::HashSet::new(),
             model_metadata: std::collections::HashMap::new(),
+            is_vertex_sa: false,
+            vertex_location: None,
         }
     }
 

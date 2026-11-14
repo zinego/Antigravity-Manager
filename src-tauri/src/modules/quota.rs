@@ -301,6 +301,16 @@ pub async fn fetch_quota_with_cache(
 ) -> crate::error::AppResult<(QuotaData, Option<String>)> {
     use crate::error::AppError;
 
+    if let Some(acc) = account_id.and_then(|id| crate::modules::load_account(id).ok()) {
+        if acc.token.is_vertex_service_account() {
+            let pid = acc
+                .token
+                .project_id
+                .or_else(|| cached_project_id.map(ToString::to_string));
+            return Ok((crate::modules::vertex::build_synthetic_vertex_quota(), pid));
+        }
+    }
+
     // `loadCodeAssist` 是订阅等级的唯一权威来源，必须每次都调用。
     //
     // 历史实现为了「省一次 API 调用」，在 project_id 已缓存且账号已有 tier 时直接跳过
@@ -990,6 +1000,18 @@ pub async fn get_valid_token_for_warmup(
         }
     }
 
+    if let Some(sa) = account.token.service_account.as_ref() {
+        let pid = account
+            .token
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(sa.project_id.as_str())
+            .to_string();
+        return Ok((account.token.access_token, pid));
+    }
+
     // Fetch project_id
     let (project_id, _) = fetch_project_id(
         &account.token.access_token,
@@ -1072,10 +1094,10 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
     loop {
         let all_accounts = crate::modules::account::list_accounts().unwrap_or_default();
-        // [FIX] 过滤掉禁用反代的账号
+        // [FIX] 过滤掉禁用反代的账号与 Vertex Service Account（不走 Antigravity warmup）
         let target_accounts: Vec<_> = all_accounts
             .into_iter()
-            .filter(|a| !a.disabled && !a.proxy_disabled)
+            .filter(|a| !a.disabled && !a.proxy_disabled && !a.token.is_vertex_service_account())
             .collect();
 
         if target_accounts.is_empty() {
@@ -1296,6 +1318,10 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
 
     if account_owned.disabled || account_owned.proxy_disabled {
         return Err("Account is disabled".to_string());
+    }
+
+    if account_owned.token.is_vertex_service_account() {
+        return Ok("Vertex service account does not require warmup".to_string());
     }
 
     let email = account_owned.email.clone();

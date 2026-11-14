@@ -1569,19 +1569,61 @@ async fn admin_get_current_account(
     Ok(Json(response))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AddAccountRequest {
-    refresh_token: String,
-}
-
 async fn admin_add_account(
     State(state): State<AppState>,
-    Json(payload): Json<AddAccountRequest>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let account = state
+    let requested_priority = match payload.get("priority").filter(|v| !v.is_null()) {
+        Some(v) => Some(
+            crate::models::account::deserialize_priority(v).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: e.to_string(),
+                    }),
+                )
+            })?,
+        ),
+        None => None,
+    };
+
+    let credential_input = if let Some(rt) = payload
+        .get("refresh_token")
+        .or_else(|| payload.get("refreshToken"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        rt.to_string()
+    } else if payload
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t == "service_account" || t == "vertex")
+        || payload
+            .get("service_account")
+            .or_else(|| payload.get("serviceAccount"))
+            .is_some_and(|v| !v.is_null())
+    {
+        serde_json::to_string(&payload).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid Vertex service account JSON: {}", e),
+                }),
+            )
+        })?
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Missing refresh_token or Vertex service_account JSON".to_string(),
+            }),
+        ));
+    };
+
+    let mut account = state
         .account_service
-        .add_account(&payload.refresh_token)
+        .add_account(&credential_input)
         .await
         .map_err(|e| {
             (
@@ -1589,6 +1631,16 @@ async fn admin_add_account(
                 Json(ErrorResponse { error: e }),
             )
         })?;
+
+    if let Some(priority) = requested_priority {
+        crate::modules::account::update_account_priority(&account.id, priority).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+        account.priority = priority;
+    }
 
     // [FIX #1166] 账号变动后立即重新加载 TokenManager
     if let Err(e) = state.token_manager.load_accounts().await {
@@ -1720,8 +1772,9 @@ async fn admin_switch_account(
     }
 }
 
-async fn admin_refresh_all_quotas() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
-{
+async fn admin_refresh_all_quotas(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     logger::log_info("[API] Starting refresh of all account quotas");
     let stats = account::refresh_all_quotas_logic().await.map_err(|e| {
         (
@@ -1729,6 +1782,13 @@ async fn admin_refresh_all_quotas() -> Result<impl IntoResponse, (StatusCode, Js
             Json(ErrorResponse { error: e }),
         )
     })?;
+
+    if let Err(e) = state.token_manager.load_accounts().await {
+        logger::log_error(&format!(
+            "[API] Failed to reload accounts after quota refresh: {}",
+            e
+        ));
+    }
 
     Ok(Json(stats))
 }
@@ -3296,6 +3356,7 @@ async fn admin_reorder_accounts(
 }
 
 async fn admin_fetch_account_quota(
+    State(state): State<AppState>,
     Path(account_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let mut account = crate::modules::load_account(&account_id).map_err(|e| {
@@ -3322,6 +3383,8 @@ async fn admin_fetch_account_quota(
             Json(ErrorResponse { error: e }),
         )
     })?;
+
+    let _ = state.token_manager.reload_account(&account_id).await;
 
     let mut quota = quota;
     quota.ensure_subscription_tier();

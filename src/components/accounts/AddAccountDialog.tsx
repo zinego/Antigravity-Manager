@@ -17,6 +17,142 @@ interface AddAccountDialogProps {
 
 type Status = 'idle' | 'loading' | 'success' | 'error';
 
+function isStandardServiceAccountRecord(obj: unknown): obj is Record<string, unknown> {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+        return false;
+    }
+
+    const record = obj as Record<string, unknown>;
+    return (
+        record.type === 'service_account' &&
+        typeof record.client_email === 'string' &&
+        record.client_email.trim().length > 0 &&
+        typeof record.private_key === 'string' &&
+        record.private_key.trim().length > 0 &&
+        typeof record.project_id === 'string' &&
+        record.project_id.trim().length > 0
+    );
+}
+
+function isServiceAccountObject(obj: unknown): obj is Record<string, unknown> {
+    if (isStandardServiceAccountRecord(obj)) {
+        return true;
+    }
+
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+        return false;
+    }
+
+    const record = obj as Record<string, unknown>;
+    return record.type === 'vertex' && isStandardServiceAccountRecord(record.service_account);
+}
+
+function extractServiceAccountEmail(obj: Record<string, unknown>): string {
+    if (typeof obj.client_email === 'string' && obj.client_email.trim()) {
+        return obj.client_email.trim();
+    }
+
+    const nestedSa = obj.service_account;
+    if (nestedSa && typeof nestedSa === 'object' && !Array.isArray(nestedSa)) {
+        const nestedEmail = (nestedSa as Record<string, unknown>).client_email;
+        if (typeof nestedEmail === 'string' && nestedEmail.trim()) {
+            return nestedEmail.trim();
+        }
+    }
+
+    if (typeof obj.email === 'string' && obj.email.trim()) {
+        return obj.email.trim();
+    }
+
+    return '';
+}
+
+function tryParseServiceAccountJson(raw: string): Record<string, unknown> | null {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith('{')) {
+        return null;
+    }
+    try {
+        const parsed: unknown = JSON.parse(trimmed);
+        return isServiceAccountObject(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
+function buildBatchEntriesFromArray(items: unknown[]): accountService.ImportAccountEntry[] {
+    const entries: accountService.ImportAccountEntry[] = [];
+    const seenTokens = new Set<string>();
+
+    const pushUniqueEntry = (email: string, tokenPayload: string) => {
+        if (!tokenPayload || seenTokens.has(tokenPayload)) {
+            return;
+        }
+        seenTokens.add(tokenPayload);
+        entries.push({ email, refresh_token: tokenPayload });
+    };
+
+    for (const item of items) {
+        if (isServiceAccountObject(item)) {
+            pushUniqueEntry(extractServiceAccountEmail(item), JSON.stringify(item));
+            continue;
+        }
+
+        if (typeof item === 'string') {
+            const trimmedItem = item.trim();
+            if (trimmedItem.startsWith('1//')) {
+                pushUniqueEntry('', trimmedItem);
+                continue;
+            }
+            const parsedSa = tryParseServiceAccountJson(trimmedItem);
+            if (parsedSa) {
+                pushUniqueEntry(extractServiceAccountEmail(parsedSa), trimmedItem);
+            }
+            continue;
+        }
+
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+            continue;
+        }
+
+        const record = item as Record<string, unknown>;
+        const rawEmail =
+            typeof record.email === 'string'
+                ? record.email.trim()
+                : typeof record.name === 'string'
+                    ? record.name.trim()
+                    : '';
+
+        const nestedToken =
+            record.token && typeof record.token === 'object' && !Array.isArray(record.token)
+                ? (record.token as Record<string, unknown>).refresh_token
+                : undefined;
+
+        const rawToken =
+            typeof record.refresh_token === 'string'
+                ? record.refresh_token.trim()
+                : typeof nestedToken === 'string'
+                    ? nestedToken.trim()
+                    : '';
+
+        if (!rawToken) {
+            continue;
+        }
+
+        if (rawToken.startsWith('1//')) {
+            pushUniqueEntry(rawEmail, rawToken);
+            continue;
+        }
+
+        const parsedSa = tryParseServiceAccountJson(rawToken);
+        if (parsedSa) {
+            pushUniqueEntry(rawEmail || extractServiceAccountEmail(parsedSa), rawToken);
+        }
+    }
+
+    return entries;
+}
+
 function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
     const { t } = useTranslation();
     const fetchAccounts = useAccountStore(state => state.fetchAccounts);
@@ -32,7 +168,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
     const [status, setStatus] = useState<Status>('idle');
     const [message, setMessage] = useState('');
 
-    const { startOAuthLogin, completeOAuthLogin, cancelOAuthLogin, importFromDb, importFromCustomDb } = useAccountStore();
+    const { startOAuthLogin, completeOAuthLogin, cancelOAuthLogin, batchImportAccounts, importFromDb, importFromCustomDb } = useAccountStore();
 
     const oauthUrlRef = useRef(oauthUrl);
     const statusRef = useRef(status);
@@ -192,7 +328,8 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
     };
 
     const handleSubmit = async () => {
-        if (!refreshToken) {
+        const input = refreshToken.trim();
+        if (!input) {
             setStatus('error');
             setMessage(t('accounts.add.token.error_token'));
             return;
@@ -200,32 +337,77 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
 
         setStatus('loading');
 
-        // 1. 尝试解析输入
-        let tokens: string[] = [];
-        const input = refreshToken.trim();
+        // 1. 先尝试解析为 JSON (支持 Service Account JSON 对象及批量 JSON 数组)
+        let parsed: unknown;
+        let jsonParsed = false;
 
         try {
-            // 尝试解析为 JSON
-            if (input.startsWith('[') && input.endsWith(']')) {
-                const parsed = JSON.parse(input);
-                if (Array.isArray(parsed)) {
-                    tokens = parsed
-                        .map((item: any) => item.refresh_token)
-                        .filter((t: any) => typeof t === 'string' && t.startsWith('1//'));
-                }
-            }
+            parsed = JSON.parse(input);
+            jsonParsed = true;
         } catch (e) {
-            // JSON 解析失败,忽略
+            // JSON 解析失败,忽略并回退到正则提取
             console.debug('JSON parse failed, falling back to regex', e);
         }
 
-        // 2. 如果 JSON 解析没有结果,尝试正则提取 (或者输入不是 JSON)
-        if (tokens.length === 0) {
-            const regex = /1\/\/[a-zA-Z0-9_\-]+/g;
-            const matches = input.match(regex);
-            if (matches) {
-                tokens = matches;
+        if (jsonParsed) {
+            if (isServiceAccountObject(parsed)) {
+                const emailFromJson = extractServiceAccountEmail(parsed);
+                setMessage(t('accounts.add.token.batch_progress', { current: 1, total: 1 }));
+                try {
+                    await onAdd(emailFromJson, JSON.stringify(parsed));
+                    setStatus('success');
+                    setMessage(t('accounts.add.token.batch_success', { count: 1 }));
+                    setTimeout(() => {
+                        setIsOpen(false);
+                        resetState();
+                    }, 1500);
+                } catch (error) {
+                    console.error('Failed to add service account:', error);
+                    const errorMsg = error instanceof Error ? error.message : String(error);
+                    setStatus('error');
+                    setMessage(errorMsg ? `${t('accounts.add.token.batch_fail')}: ${errorMsg}` : t('accounts.add.token.batch_fail'));
+                }
+                return;
             }
+
+            if (Array.isArray(parsed)) {
+                const entries = buildBatchEntriesFromArray(parsed);
+                if (entries.length > 0) {
+                    setMessage(t('accounts.add.token.batch_progress', { current: 1, total: entries.length }));
+                    try {
+                        const result = await batchImportAccounts(entries);
+                        if (result.failed === 0 && result.success > 0) {
+                            setStatus('success');
+                            setMessage(t('accounts.add.token.batch_success', { count: result.success }));
+                            setTimeout(() => {
+                                setIsOpen(false);
+                                resetState();
+                            }, 1500);
+                        } else if (result.success > 0) {
+                            setStatus('success');
+                            setMessage(t('accounts.add.token.batch_partial', { success: result.success, fail: result.failed }));
+                        } else {
+                            const firstError = result.errors?.[0];
+                            setStatus('error');
+                            setMessage(firstError ? `${t('accounts.add.token.batch_fail')}: ${firstError}` : t('accounts.add.token.batch_fail'));
+                        }
+                    } catch (error) {
+                        console.error('Batch import failed:', error);
+                        const errorMsg = error instanceof Error ? error.message : String(error);
+                        setStatus('error');
+                        setMessage(errorMsg ? `${t('accounts.add.token.batch_fail')}: ${errorMsg}` : t('accounts.add.token.batch_fail'));
+                    }
+                    return;
+                }
+            }
+        }
+
+        // 2. 如果 JSON 未匹配到结构化条目,回退到 1//... 正则提取
+        let tokens: string[] = [];
+        const regex = /1\/\/[a-zA-Z0-9_\-]+/g;
+        const matches = input.match(regex);
+        if (matches) {
+            tokens = matches;
         }
 
         // 去重

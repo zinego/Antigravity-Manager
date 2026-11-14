@@ -420,7 +420,7 @@
             "title": "Add Account",
             "tabs": {
                 "oauth": "OAuth",
-                "token": "Refresh Token",
+                "token": "Token / JSON",
                 "import": "Import DB"
             },
             "oauth": {
@@ -446,10 +446,10 @@
                 "manual_submitted": "Authorization code submitted. Backend is processing..."
             },
             "token": {
-                "label": "Refresh Token",
-                "placeholder": "Paste your Refresh Token here (Batch supported)\n\nSupported formats:\n1. Single Token (1//...)\n2. JSON Array (with refresh_token field)\n3. Any text containing tokens (Auto-extraction)",
-                "hint": "Tip: You can paste multiple tokens or a JSON array to import in batch.",
-                "error_token": "Please enter Refresh Token",
+                "label": "Refresh Token / Service Account JSON",
+                "placeholder": "Paste your Refresh Token or Google Cloud Service Account JSON here (Batch supported)\n\nSupported formats:\n1. Single Token (1//...)\n2. Service Account JSON ({\"type\": \"service_account\", ...} or Vertex wrapper)\n3. JSON Array (with refresh_token or Service Account objects)\n4. Any text containing tokens (Auto-extraction)",
+                "hint": "Tip: Paste multiple Refresh Tokens (1//...), a Google Cloud Service Account JSON (\"type\": \"service_account\"), or a mixed JSON array to auto-detect and import in batch.",
+                "error_token": "Please enter a Refresh Token or valid Service Account JSON",
                 "batch_progress": "Importing {{current}}/{{total}} accounts...",
                 "batch_success": "Successfully imported {{count}} accounts",
                 "batch_partial": "Import finished: {{success}} success, {{fail}} failed",

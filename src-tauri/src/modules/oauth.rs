@@ -548,6 +548,14 @@ pub async fn exchange_code(code: &str, redirect_uri: &str) -> Result<TokenRespon
     exchange_code_with_client(code, redirect_uri, None).await
 }
 
+pub async fn create_oauth_client_for_account(account_id: Option<&str>) -> rquest::Client {
+    if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+        pool.get_effective_standard_client(account_id, 60).await
+    } else {
+        crate::utils::http::get_long_standard_client()
+    }
+}
+
 async fn refresh_access_token_once(
     refresh_token: &str,
     account_id: Option<&str>,
@@ -751,6 +759,30 @@ pub async fn ensure_fresh_token(
     // Keep enough validity to avoid immediate post-switch refresh failure.
     if current_token.expiry_timestamp > now + TOKEN_REFRESH_SKEW_SECONDS {
         return Ok(current_token.clone());
+    }
+
+    if let Some(sa) = current_token.service_account.as_ref() {
+        crate::modules::logger::log_info(&format!(
+            "Vertex SA token expiring soon for account {:?}, minting fresh assertion...",
+            account_id
+        ));
+        let (access_token, expires_in) =
+            crate::modules::vertex::exchange_service_account_token(sa, account_id).await?;
+        let mut refreshed = current_token.clone();
+        refreshed.access_token = access_token;
+        refreshed.expires_in = expires_in;
+        refreshed.expiry_timestamp = chrono::Utc::now().timestamp() + expires_in;
+        refreshed.token_type = "Bearer".to_string();
+        if refreshed
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            refreshed.project_id = Some(sa.project_id.clone());
+        }
+        return Ok(refreshed);
     }
 
     // Need to refresh

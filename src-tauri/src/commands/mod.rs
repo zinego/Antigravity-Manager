@@ -91,7 +91,10 @@ pub async fn list_accounts(
         }
     }
 
-    Ok(accounts)
+    Ok(accounts
+        .into_iter()
+        .map(|account| account.redacted_for_ipc())
+        .collect())
 }
 
 /// 手动解除账号的小黑屋限制 (QoS 隔离与冷却)
@@ -149,7 +152,7 @@ pub async fn add_account(
     )
     .await;
 
-    Ok(account)
+    Ok(account.redacted_for_ipc())
 }
 
 /// [NEW #3726] 批量异步高性能导入账号
@@ -270,7 +273,7 @@ pub async fn get_current_account() -> Result<Option<Account>, String> {
 
     if let Some(id) = account_id {
         // modules::logger::log_info(&format!("   Found current account ID: {}", id));
-        modules::load_account(&id).map(Some)
+        modules::load_account(&id).map(|acc| Some(acc.redacted_for_ipc()))
     } else {
         modules::logger::log_info("   No current account set");
         Ok(None)
@@ -692,7 +695,7 @@ pub async fn start_oauth_login(
     )
     .await;
 
-    Ok(account)
+    Ok(account.redacted_for_ipc())
 }
 
 /// 完成 OAuth 授权（不自动打开浏览器）
@@ -714,7 +717,7 @@ pub async fn complete_oauth_login(app_handle: tauri::AppHandle) -> Result<Accoun
     )
     .await;
 
-    Ok(account)
+    Ok(account.redacted_for_ipc())
 }
 
 /// 预生成 OAuth 授权链接 (不打开浏览器)
@@ -746,7 +749,10 @@ pub async fn submit_oauth_code(
     let service = modules::account_service::AccountService::new(
         crate::modules::integration::SystemManager::Desktop(app_handle),
     );
-    service.submit_oauth_code(code, state).await
+    service
+        .submit_oauth_code(code, state)
+        .await
+        .map(|account| account.redacted_for_ipc())
 }
 
 #[tauri::command]
@@ -782,7 +788,10 @@ pub async fn import_v1_accounts(
     // Reload token pool
     let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
 
-    Ok(accounts)
+    Ok(accounts
+        .into_iter()
+        .map(|account| account.redacted_for_ipc())
+        .collect())
 }
 
 #[tauri::command]
@@ -809,7 +818,10 @@ pub async fn import_from_db(
     crate::modules::tray::update_tray_menus(&app);
     let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
 
-    Ok(imported_accounts)
+    Ok(imported_accounts
+        .into_iter()
+        .map(|account| account.redacted_for_ipc())
+        .collect())
 }
 
 #[tauri::command]
@@ -835,7 +847,7 @@ pub async fn import_custom_db(
     // Reload token pool
     let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
 
-    Ok(account)
+    Ok(account.redacted_for_ipc())
 }
 
 #[tauri::command]
@@ -899,7 +911,7 @@ pub async fn sync_account_from_db(
     // Reload token pool
     let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
 
-    Ok(Some(account))
+    Ok(Some(account.redacted_for_ipc()))
 }
 
 fn resolve_existing_or_parent(path: &Path) -> Result<PathBuf, String> {

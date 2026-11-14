@@ -72,23 +72,31 @@ function Accounts() {
     failed: number;
     current_email?: string;
   } | null>(null);
+  const isPageImportActiveRef = useRef(false);
 
-  // [NEW #3726] 监听后端批量导入流式进度事件
+  // [NEW #3726] 监听后端批量导入流式进度事件 (仅当本页 processImportData 发起导入时展示页级进度弹窗)
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let disposed = false;
     if (isTauri()) {
       import('@tauri-apps/api/event').then(({ listen }) => {
         listen<{ current: number; total: number; success: number; failed: number; current_email?: string }>(
           'accounts://import-progress',
           (event) => {
+            if (!isPageImportActiveRef.current) return;
             setImportProgress(event.payload);
           }
         ).then((unsub) => {
-          unlisten = unsub;
+          if (disposed) {
+            unsub();
+          } else {
+            unlisten = unsub;
+          }
         });
       });
     }
     return () => {
+      disposed = true;
       if (unlisten) unlisten();
     };
   }, []);
@@ -702,6 +710,7 @@ function Accounts() {
       }
     }
 
+    isPageImportActiveRef.current = true;
     setImportProgress({
       current: 0,
       total: validEntries.length,
@@ -734,6 +743,7 @@ function Accounts() {
       console.error("Batch import failed:", error);
       showToast(t("accounts.import_fail", { error: String(error) }), "error");
     } finally {
+      isPageImportActiveRef.current = false;
       setImportProgress(null);
     }
   };

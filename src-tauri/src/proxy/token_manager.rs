@@ -163,6 +163,8 @@ pub struct ProxyToken {
     pub available_models: std::collections::HashSet<String>,
     /// [NEW #3677] 模型元数据缓存 (display_name, supports_images, supports_thinking 等)
     pub model_metadata: HashMap<String, crate::models::quota::ModelListingMeta>,
+    pub is_vertex_sa: bool,
+    pub vertex_location: Option<String>,
 }
 
 /// 活跃在途请求 RAII Guard：在请求处理或流式传输期间持有，Drop 时原子释放并发计数
@@ -467,13 +469,44 @@ impl TokenManager {
     /// * `account_id` - 目标账号 ID
     /// * `buffer_secs` - 有效期缓冲时间（秒），若当前时间小于过期时间减去该缓冲，则视为已刷新直接返回
     /// * `timeout_duration` - 调用底层 OAuth 刷新的超时限制
+    async fn refresh_vertex_token_from_disk(
+        account_path: &PathBuf,
+        account_id: &str,
+    ) -> Result<crate::modules::oauth::TokenResponse, String> {
+        let raw = std::fs::read_to_string(account_path)
+            .map_err(|e| format!("Failed to read Vertex SA account file: {}", e))?;
+        let account_json: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("Invalid Vertex SA account JSON: {}", e))?;
+        let sa_val = account_json
+            .get("token")
+            .and_then(|t| t.get("service_account"))
+            .ok_or_else(|| "Missing token.service_account in Vertex SA account file".to_string())?;
+        let sa: crate::modules::vertex::ServiceAccountCredentials =
+            serde_json::from_value(sa_val.clone())
+                .map_err(|e| format!("Invalid service_account in account file: {}", e))?;
+        let (access_token, expires_in) =
+            crate::modules::vertex::exchange_service_account_token(&sa, Some(account_id)).await?;
+        Ok(crate::modules::oauth::TokenResponse {
+            access_token,
+            expires_in,
+            token_type: "Bearer".to_string(),
+            refresh_token: None,
+            id_token: None,
+            oauth_client_key: Some(crate::modules::vertex::VERTEX_OAUTH_CLIENT_KEY.to_string()),
+        })
+    }
+
+    pub fn has_vertex_accounts(&self) -> bool {
+        self.tokens.iter().any(|entry| entry.value().is_vertex_sa)
+    }
+
     pub async fn refresh_account_token_with_timeout(
         &self,
         account_id: &str,
         buffer_secs: i64,
         timeout_duration: std::time::Duration,
     ) -> Result<ProxyToken, String> {
-        let (token_email, refresh_token, account_path) = {
+        let (token_email, refresh_token, account_path, is_vertex_sa) = {
             let entry = self
                 .tokens
                 .get(account_id)
@@ -482,10 +515,11 @@ impl TokenManager {
                 entry.email.clone(),
                 entry.refresh_token.clone(),
                 entry.account_path.clone(),
+                entry.is_vertex_sa,
             )
         };
 
-        if refresh_token.is_empty() {
+        if refresh_token.is_empty() && !is_vertex_sa {
             return Err(format!("账号 {} 的 refresh_token 为空", token_email));
         }
 
@@ -519,15 +553,23 @@ impl TokenManager {
             }
 
             tracing::debug!(
-                "正在执行 OAuth 刷新 (账号: {}, 超时: {:?})...",
+                "正在执行{}刷新 (账号: {}, 超时: {:?})...",
+                if is_vertex_sa {
+                    " Vertex SA "
+                } else {
+                    " OAuth "
+                },
                 token_email,
                 timeout_duration
             );
 
-            let refresh_future =
-                crate::modules::oauth::refresh_access_token(&refresh_token, Some(account_id));
+            let refresh_result = if is_vertex_sa {
+                Self::refresh_vertex_token_from_disk(&account_path, account_id).await
+            } else {
+                crate::modules::oauth::refresh_access_token(&refresh_token, Some(account_id)).await
+            };
 
-            match refresh_future.await {
+            match refresh_result {
                 Ok(token_response) => {
                     tracing::debug!("账号 {} Token 刷新成功！", token_email);
                     self.invalid_grant_failures.remove(account_id);
@@ -909,6 +951,25 @@ impl TokenManager {
         let count = new_tokens.len();
 
         // 阶段 2：零停机平滑原子同步到 self.tokens
+        // 同步 Vertex SA 注册表（仅维护本 TokenManager 管理的账号，避免并发干扰）
+        for entry in self.tokens.iter() {
+            let old_id = entry.key();
+            let keep_vertex = new_tokens.get(old_id).is_some_and(|tok| tok.is_vertex_sa);
+            if !keep_vertex && entry.value().is_vertex_sa {
+                crate::modules::vertex::unregister_vertex_account(old_id);
+            }
+        }
+        for (k, v) in &new_tokens {
+            if v.is_vertex_sa {
+                crate::modules::vertex::register_vertex_account(
+                    k,
+                    v.project_id.as_deref().unwrap_or(""),
+                    v.vertex_location
+                        .as_deref()
+                        .unwrap_or(crate::modules::vertex::DEFAULT_VERTEX_LOCATION),
+                );
+            }
+        }
         // 剔除已在磁盘删除或停用的账号
         self.tokens.retain(|k, _| new_tokens.contains_key(k));
         // 更新或插入新载入的有效账号
@@ -993,6 +1054,18 @@ impl TokenManager {
 
         match self.load_single_account(&path).await {
             Ok(Some(token)) => {
+                if token.is_vertex_sa {
+                    crate::modules::vertex::register_vertex_account(
+                        account_id,
+                        token.project_id.as_deref().unwrap_or(""),
+                        token
+                            .vertex_location
+                            .as_deref()
+                            .unwrap_or(crate::modules::vertex::DEFAULT_VERTEX_LOCATION),
+                    );
+                } else {
+                    crate::modules::vertex::unregister_vertex_account(account_id);
+                }
                 self.tokens.insert(account_id.to_string(), token);
                 self.sync_image_scheduler_accounts();
                 Ok(())
@@ -1015,6 +1088,7 @@ impl TokenManager {
 
     /// 从内存中彻底移除指定账号及其关联数据 (Issue #1477)
     pub fn remove_account(&self, account_id: &str) {
+        crate::modules::vertex::unregister_vertex_account(account_id);
         // ... (省略原有逻辑)
         if self.tokens.remove(account_id).is_some() {
             tracing::info!("[Proxy] Removed account {} from memory cache", account_id);
@@ -1298,10 +1372,23 @@ impl TokenManager {
             .ok_or("缺少 access_token")?
             .to_string();
 
-        let refresh_token = token_obj["refresh_token"]
-            .as_str()
-            .ok_or("缺少 refresh_token")?
-            .to_string();
+        let service_account_val = token_obj
+            .get("service_account")
+            .filter(|v| !v.is_null() && v.is_object());
+        let is_vertex_sa = service_account_val.is_some();
+
+        let refresh_token = if is_vertex_sa {
+            token_obj
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            token_obj["refresh_token"]
+                .as_str()
+                .ok_or("缺少 refresh_token")?
+                .to_string()
+        };
 
         let expires_in = token_obj["expires_in"].as_i64().ok_or("缺少 expires_in")?;
 
@@ -1314,7 +1401,25 @@ impl TokenManager {
             .get("project_id")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+            .map(|s| s.to_string())
+            .or_else(|| {
+                service_account_val
+                    .and_then(|sa| sa.get("project_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+            });
+
+        let vertex_location = token_obj
+            .get("vertex_location")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                is_vertex_sa.then(|| crate::modules::vertex::DEFAULT_VERTEX_LOCATION.to_string())
+            });
 
         // 【新增】提取订阅等级 (subscription_tier 为 "FREE" | "PRO" | "ULTRA")
         let subscription_tier = account
@@ -1617,6 +1722,29 @@ impl TokenManager {
             }
         }
 
+        if is_vertex_sa {
+            if available_models.is_empty() {
+                for &model_id in crate::modules::vertex::VERTEX_MODEL_IDS {
+                    available_models.insert(model_id.to_string());
+                    model_quotas.entry(model_id.to_string()).or_insert(100);
+                }
+            }
+            available_models.retain(|m| crate::modules::vertex::is_vertex_supported_model(m));
+            model_quotas.retain(|m, _| crate::modules::vertex::is_vertex_supported_model(m));
+            if subscription_tier.is_none() {
+                // Keep Vertex SA tier explicit when quota metadata was omitted
+                tracing::debug!(
+                    "Vertex SA {} missing subscription_tier, defaulting to ENTERPRISE",
+                    email
+                );
+            }
+        }
+        let subscription_tier = if is_vertex_sa && subscription_tier.is_none() {
+            Some("ENTERPRISE".to_string())
+        } else {
+            subscription_tier
+        };
+
         // Weekly availability is mandatory; the optional switch only controls 5h locks.
         self.sync_zero_quota_circuit_breaker(&account_id, &account);
 
@@ -1657,6 +1785,8 @@ impl TokenManager {
             model_limits,
             available_models,
             model_metadata,
+            is_vertex_sa,
+            vertex_location,
         }))
     }
 
@@ -2906,9 +3036,15 @@ impl TokenManager {
             })
             .collect();
         tokens_snapshot.retain(|token| !excluded_accounts.contains(&token.account_id));
+        if !crate::modules::vertex::is_vertex_supported_model(target_model) {
+            tokens_snapshot.retain(|token| !token.is_vertex_sa);
+        }
         let mut total = tokens_snapshot.len();
         if total == 0 {
-            return Err("Token pool is empty".to_string());
+            return Err(format!(
+                "No accounts available with quota for model: {}",
+                target_model
+            ));
         }
 
         // [NEW] 1. 动态能力过滤 (Capability-First Dynamic Discovery)
@@ -2932,7 +3068,7 @@ impl TokenManager {
             .collect();
 
         let is_advanced_canary = if !accounts_with_capability.is_empty() {
-            // 只要池中有明确支持的账号，且并非所有 FREE 账号都普惠支持（例如只在 PRO/ULTRA 账号中出现），
+            // 只要池中有明确支持的账号，且并非所有 FREE 账号都普惠支持（例如只在 PRO/ULTRA/ENTERPRISE 账号中出现），
             // 就直接将候选池收敛到这些具备实际能力的账号！
             let only_in_paid_tiers = accounts_with_capability.iter().all(|t| {
                 matches!(
@@ -2940,7 +3076,7 @@ impl TokenManager {
                         .as_deref()
                         .map(str::to_uppercase)
                         .as_deref(),
-                    Some("PRO") | Some("ULTRA")
+                    Some("PRO") | Some("ULTRA") | Some("ENTERPRISE")
                 )
             });
             // 如果仅在付费账号中出现，或者只有部分账号拥有（灰度特征），均触发精准收敛
@@ -2964,14 +3100,14 @@ impl TokenManager {
             if !accounts_with_capability.is_empty() {
                 tokens_snapshot = accounts_with_capability;
             } else {
-                // 冷启动：先行保留符合基本高级订阅资质的账号 (PRO / ULTRA)
+                // 冷启动：先行保留符合基本高级订阅资质的账号 (PRO / ULTRA / ENTERPRISE)
                 tokens_snapshot.retain(|t| {
                     matches!(
                         t.subscription_tier
                             .as_deref()
                             .map(str::to_uppercase)
                             .as_deref(),
-                        Some("PRO") | Some("ULTRA")
+                        Some("PRO") | Some("ULTRA") | Some("ENTERPRISE")
                     )
                 });
                 if tokens_snapshot.is_empty() {
@@ -3964,6 +4100,8 @@ impl TokenManager {
                         token.account_id.clone(),
                         token.access_token.clone(),
                         token.refresh_token.clone(),
+                        token.account_path.clone(),
+                        token.is_vertex_sa,
                         token.timestamp,
                         token.expires_in,
                         chrono::Utc::now().timestamp(),
@@ -3979,6 +4117,8 @@ impl TokenManager {
             account_id,
             current_access_token,
             refresh_token,
+            account_path,
+            is_vertex_sa,
             timestamp,
             expires_in,
             now,
@@ -4005,8 +4145,14 @@ impl TokenManager {
 
         tracing::info!("[Warmup] Token for {} is expiring, refreshing...", email);
 
-        // 调用 OAuth 刷新 token
-        match crate::modules::oauth::refresh_access_token(&refresh_token, Some(&account_id)).await {
+        let refresh_res = if is_vertex_sa {
+            Self::refresh_vertex_token_from_disk(&account_path, &account_id).await
+        } else {
+            crate::modules::oauth::refresh_access_token(&refresh_token, Some(&account_id)).await
+        };
+
+        // 调用 OAuth / Vertex SA 刷新 token
+        match refresh_res {
             Ok(token_response) => {
                 tracing::info!("[Warmup] Token refresh successful for {}", email);
                 let new_now = chrono::Utc::now().timestamp();
@@ -4335,6 +4481,10 @@ impl TokenManager {
                     }
                 }
 
+                if token.is_vertex_sa && !crate::modules::vertex::is_vertex_supported_model(model) {
+                    return false;
+                }
+
                 // 生图独立大池判定
                 if is_image {
                     if token.model_quotas.iter().any(|(known, quota)| {
@@ -4537,6 +4687,12 @@ impl TokenManager {
                     );
                     continue;
                 }
+            }
+
+            if token.is_vertex_sa
+                && !crate::modules::vertex::is_vertex_supported_model(target_model)
+            {
+                continue;
             }
 
             // 1. 检查是否被限流（兼顾全账号级与特定模型级 QuotaExhausted）
@@ -6178,6 +6334,73 @@ impl TokenManager {
     }
 
     async fn send_pure_hello_probe_internal(token: &ProxyToken) -> Result<f64, String> {
+        if token.is_vertex_sa {
+            let model = Self::select_probe_model(token)
+                .unwrap_or_else(|| "gemini-3-flash-preview".to_string());
+            let vertex_model = crate::modules::vertex::resolve_vertex_model_id(&model);
+            let meta = crate::modules::vertex::get_vertex_account_meta(&token.account_id);
+            let project_id = token
+                .project_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .or_else(|| meta.as_ref().map(|m| m.project_id.as_str()))
+                .unwrap_or("");
+            let location = token
+                .vertex_location
+                .as_deref()
+                .or_else(|| meta.as_ref().map(|m| m.location.as_str()))
+                .unwrap_or(crate::modules::vertex::DEFAULT_VERTEX_LOCATION);
+            let endpoint = crate::modules::vertex::build_vertex_endpoint_url(
+                project_id,
+                location,
+                &vertex_model,
+                "streamGenerateContent",
+                Some("alt=sse"),
+            );
+            let body = serde_json::json!({
+                "contents": [{
+                    "role": "user",
+                    "parts": [{ "text": "hello" }]
+                }],
+                "generationConfig": {
+                    "maxOutputTokens": 10,
+                    "temperature": 0.0
+                }
+            });
+            let client =
+                crate::modules::oauth::create_oauth_client_for_account(Some(&token.account_id))
+                    .await;
+            let start = std::time::Instant::now();
+            let resp = client
+                .post(endpoint.as_str())
+                .header("Authorization", format!("Bearer {}", token.access_token))
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .timeout(std::time::Duration::from_millis(8000))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("{} -> {}", endpoint, e))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!(
+                    "{} -> HTTP {} (model={})",
+                    endpoint, status, vertex_model
+                ));
+            }
+            use futures::StreamExt;
+            let mut stream = resp.bytes_stream();
+            if let Some(chunk_res) = stream.next().await {
+                let _ = chunk_res.map_err(|e| format!("{} -> stream error: {}", endpoint, e))?;
+                return Ok(start.elapsed().as_micros() as f64 / 1000.0);
+            }
+            return Err(format!(
+                "{} -> empty stream (model={})",
+                endpoint, vertex_model
+            ));
+        }
+
         let model = Self::select_probe_model(token)
             .ok_or_else(|| format!("探针跳过：账号 {} 缺少可用模型元数据", token.email))?;
         let body = Self::build_probe_envelope(token, &model);
@@ -7754,6 +7977,8 @@ mod tests {
             model_limits: HashMap::new(),
             available_models: std::collections::HashSet::new(),
             model_metadata: HashMap::new(),
+            is_vertex_sa: false,
+            vertex_location: None,
         }
     }
 
@@ -8148,6 +8373,8 @@ mod tests {
             model_limits: HashMap::new(),
             available_models: std::collections::HashSet::new(),
             model_metadata: HashMap::new(),
+            is_vertex_sa: false,
+            vertex_location: None,
         }
     }
 
@@ -8782,6 +9009,8 @@ mod tests {
             model_limits: limits1,
             available_models: HashSet::new(),
             model_metadata: HashMap::new(),
+            is_vertex_sa: false,
+            vertex_location: None,
         };
 
         // 账号 2: PRO 订阅，经定时刷新成功上报 Claude 5.5 模型配额
@@ -8816,6 +9045,8 @@ mod tests {
                 s
             },
             model_metadata: HashMap::new(),
+            is_vertex_sa: false,
+            vertex_location: None,
         };
 
         // 验证辅助函数检测
@@ -8912,6 +9143,8 @@ mod tests {
             model_limits: limits,
             available_models: HashSet::new(),
             model_metadata: HashMap::new(),
+            is_vertex_sa: false,
+            vertex_location: None,
         };
 
         std::fs::write(
@@ -8984,6 +9217,8 @@ mod tests {
             model_limits: HashMap::new(),
             available_models: std::collections::HashSet::new(),
             model_metadata: HashMap::new(),
+            is_vertex_sa: false,
+            vertex_location: None,
         };
 
         manager.tokens.insert(token.account_id.clone(), token);
@@ -9997,6 +10232,8 @@ mod tests {
             model_limits: HashMap::new(),
             available_models: HashSet::new(),
             model_metadata: meta,
+            is_vertex_sa: false,
+            vertex_location: None,
         };
 
         manager.tokens.insert(token.account_id.clone(), token);
@@ -10468,5 +10705,217 @@ mod tests {
             .get_token_filtered("claude", true, None, target_model, &attempted)
             .await;
         assert!(res3.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_vertex_sa_load_routing_and_model_exposure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let accounts_dir = temp_dir.path().join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let account_id = format!("vertex-sa-test-{}", uuid::Uuid::new_v4());
+        let no_quota_id = format!("vertex-sa-noquota-{}", uuid::Uuid::new_v4());
+
+        let sa_creds = crate::modules::vertex::ServiceAccountCredentials {
+            cred_type: "service_account".to_string(),
+            project_id: "proj-vertex-test-123".to_string(),
+            private_key_id: "kid-1".to_string(),
+            private_key:
+                "-----BEGIN PRIVATE KEY-----\nTEST_NOT_A_REAL_KEY\n-----END PRIVATE KEY-----\n"
+                    .to_string(),
+            client_email: "vertex-sa-test@proj-vertex-test-123.iam.gserviceaccount.com".to_string(),
+            client_id: "1234567890".to_string(),
+            token_uri: "https://oauth2.googleapis.com/token".to_string(),
+        };
+
+        let make_vertex_account = |id: &str, email: &str, with_quota: bool| {
+            let mut token = crate::models::TokenData::new(
+                "ya29.vertex-test-access-token".to_string(),
+                String::new(), // Vertex SA accounts intentionally have empty refresh_token
+                3600,
+                Some(email.to_string()),
+                Some("proj-vertex-test-123".to_string()),
+                None,
+                true,
+                None,
+            )
+            .with_oauth_client_key(Some("vertex_service_account".to_string()));
+            token.expiry_timestamp = now + 3600;
+            token.service_account = Some(sa_creds.clone());
+            token.vertex_location = Some("global".to_string());
+
+            let mut account = crate::models::Account::new(id.to_string(), email.to_string(), token);
+            if with_quota {
+                account.quota = Some(crate::modules::vertex::build_synthetic_vertex_quota());
+            }
+            account
+        };
+
+        let acc_with_quota = make_vertex_account(
+            &account_id,
+            "vertex-sa-test@proj-vertex-test-123.iam.gserviceaccount.com",
+            true,
+        );
+        let acc_no_quota = make_vertex_account(
+            &no_quota_id,
+            "vertex-sa-noquota@proj-vertex-test-123.iam.gserviceaccount.com",
+            false,
+        );
+
+        std::fs::write(
+            accounts_dir.join(format!("{}.json", account_id)),
+            serde_json::to_string(&acc_with_quota).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            accounts_dir.join(format!("{}.json", no_quota_id)),
+            serde_json::to_string(&acc_no_quota).unwrap(),
+        )
+        .unwrap();
+
+        let index_json = serde_json::json!({
+            "version": "2.0",
+            "accounts": [
+                {
+                    "id": account_id,
+                    "email": "vertex-sa-test@proj-vertex-test-123.iam.gserviceaccount.com",
+                    "name": null,
+                    "disabled": false,
+                    "proxy_disabled": false,
+                    "created_at": now,
+                    "last_used": now
+                },
+                {
+                    "id": no_quota_id,
+                    "email": "vertex-sa-noquota@proj-vertex-test-123.iam.gserviceaccount.com",
+                    "name": null,
+                    "disabled": false,
+                    "proxy_disabled": false,
+                    "created_at": now,
+                    "last_used": now
+                }
+            ],
+            "current_account_id": account_id
+        });
+        std::fs::write(
+            temp_dir.path().join("accounts.json"),
+            index_json.to_string(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+        let loaded = manager.load_accounts().await.unwrap();
+        assert_eq!(
+            loaded, 2,
+            "Both Vertex SA accounts with empty refresh_token must load"
+        );
+        assert!(manager.has_vertex_accounts());
+
+        let meta = crate::modules::vertex::get_vertex_account_meta(&account_id)
+            .expect("Vertex account metadata must be registered on load");
+        assert_eq!(meta.project_id, "proj-vertex-test-123");
+        assert_eq!(meta.location, "global");
+        assert!(crate::modules::vertex::get_vertex_account_meta(&no_quota_id).is_some());
+
+        // Vertex SA accounts must NEVER serve Claude / GPT models
+        assert_eq!(manager.accounts_with_positive_quota("claude-sonnet-4-6"), 0);
+        assert!(
+            !manager
+                .has_available_account("claude", "claude-sonnet-4-6")
+                .await
+        );
+        assert!(
+            manager
+                .get_token("claude", false, None, "claude-sonnet-4-6")
+                .await
+                .is_err(),
+            "Vertex SA accounts must not be selected for Claude requests"
+        );
+
+        // Vertex SA accounts MUST serve Vertex Gemini models
+        assert_eq!(
+            manager.accounts_with_positive_quota("gemini-3-flash-preview"),
+            2
+        );
+        assert!(
+            manager
+                .has_available_account("gemini", "gemini-3-flash-preview")
+                .await
+        );
+        let (access_token, project_id, _email, selected_id, _expires) = manager
+            .get_token("gemini", false, None, "gemini-3-flash-preview")
+            .await
+            .expect("Vertex SA token must be selected for Gemini");
+        assert_eq!(access_token, "ya29.vertex-test-access-token");
+        assert_eq!(project_id, "proj-vertex-test-123");
+        assert!(selected_id == account_id || selected_id == no_quota_id);
+
+        // Dynamic model listing under only_raw_quota_models=true exposes active Vertex models and zero Claude models
+        let custom_mapping = tokio::sync::RwLock::new(HashMap::new());
+        let dynamic_models = crate::proxy::common::model_mapping::get_all_dynamic_models(
+            &custom_mapping,
+            Some(&manager),
+            true,
+        )
+        .await;
+        for expected in [
+            "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-high",
+            "gemini-3.5-flash-tiered",
+            "gemini-3.6-flash",
+            "gemini-2.5-flash-image",
+        ] {
+            assert!(
+                dynamic_models.iter().any(|m| m == expected),
+                "get_all_dynamic_models missing Vertex model {} (got {:?})",
+                expected,
+                dynamic_models
+            );
+        }
+        assert!(
+            !dynamic_models.iter().any(|m| m.starts_with("claude")),
+            "Vertex-only pool must not expose Claude models in get_all_dynamic_models: {:?}",
+            dynamic_models
+        );
+
+        let exposed = crate::proxy::common::model_gate::downstream_exposed_models(
+            &custom_mapping,
+            &manager,
+            true,
+        )
+        .await;
+        for expected in [
+            "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-high",
+            "gemini-3.5-flash-tiered",
+            "gemini-3.6-flash",
+            "gemini-2.5-flash-image",
+        ] {
+            assert!(
+                exposed.contains(expected),
+                "downstream_exposed_models missing Vertex model {}",
+                expected
+            );
+        }
+        assert!(matches!(
+            crate::proxy::common::model_gate::gate_inbound_model(
+                Some("gemini-3.5-flash-high"),
+                &custom_mapping,
+                &manager,
+            )
+            .await,
+            crate::proxy::common::model_gate::ModelGate::Allow(_)
+        ));
+
+        // Removing accounts must clear them from the global Vertex registry
+        manager.remove_account(&account_id);
+        manager.remove_account(&no_quota_id);
+        assert!(crate::modules::vertex::get_vertex_account_meta(&account_id).is_none());
+        assert!(crate::modules::vertex::get_vertex_account_meta(&no_quota_id).is_none());
     }
 }

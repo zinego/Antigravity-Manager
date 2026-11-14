@@ -13,6 +13,52 @@ impl AccountService {
 
     /// 添加账号逻辑
     pub async fn add_account(&self, refresh_token: &str) -> Result<Account, String> {
+        if let Some(parsed) = crate::modules::vertex::parse_vertex_credentials(refresh_token)? {
+            let (access_token, expires_in) =
+                crate::modules::vertex::exchange_service_account_token(
+                    &parsed.service_account,
+                    None,
+                )
+                .await?;
+            let email = parsed.service_account.client_email.clone();
+            let project_id = parsed.service_account.project_id.clone();
+
+            let mut token = TokenData::new(
+                access_token,
+                String::new(),
+                expires_in,
+                Some(email.clone()),
+                Some(project_id.clone()),
+                None,
+                true,
+                None,
+            )
+            .with_oauth_client_key(Some(
+                crate::modules::vertex::VERTEX_OAUTH_CLIENT_KEY.to_string(),
+            ));
+            token.service_account = Some(parsed.service_account);
+            token.vertex_location = Some(parsed.location);
+
+            let mut account = modules::upsert_account(
+                email.clone(),
+                Some(format!("Vertex ({})", project_id)),
+                token,
+            )?;
+            let synthetic_quota = crate::modules::vertex::build_synthetic_vertex_quota();
+            account.update_quota(synthetic_quota);
+            if let Err(e) = modules::account::save_account(&account) {
+                modules::logger::log_warn(&format!(
+                    "[Service] Failed to save Vertex quota for {}: {}",
+                    email, e
+                ));
+            }
+            modules::logger::log_info(&format!(
+                "[Service] Added/Updated Vertex SA account: {} (project={})",
+                account.email, project_id
+            ));
+            return Ok(account);
+        }
+
         // [FIX #1583] 生成临时 UUID 作为账号上下文，避免传递 None 导致代理选择异常
         let temp_account_id = uuid::Uuid::new_v4().to_string();
 

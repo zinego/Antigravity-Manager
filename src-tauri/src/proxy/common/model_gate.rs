@@ -211,13 +211,19 @@ pub async fn downstream_exposed_models(
         }
     }
 
+    let has_vertex_sa = token_manager.has_vertex_accounts();
+
     // 裸名派生统一走 strip_tier_suffix（与路由层同口径，覆盖 -xhigh / @default 等）；
     // 只保留仍符合旗舰基准线的基底名，避免把已下线模型重新派生出来。
     let derived_bare: Vec<String> = allowed
         .iter()
         .filter_map(|id| {
             let base = model_mapping::strip_tier_suffix(id);
-            (base != *id && model_mapping::is_model_compliant_with_baseline(&base)).then_some(base)
+            (base != *id
+                && (model_mapping::is_model_compliant_with_baseline(&base)
+                    || (has_vertex_sa
+                        && crate::modules::vertex::is_vertex_model_id_exposed(&base))))
+            .then_some(base)
         })
         .collect();
     allowed.extend(derived_bare);
