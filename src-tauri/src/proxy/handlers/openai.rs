@@ -2247,7 +2247,8 @@ pub async fn handle_chat_completions(
     // thinking.budget_tokens; we infer the tier from its magnitude.
     let model_lower = openai_req.model.to_lowercase();
     let is_v3_or_above = crate::proxy::model_specs::is_gemini_v3_or_above(&openai_req.model);
-    let is_explicit_tier_model = model_lower.ends_with("-high")
+    let is_explicit_tier_model = model_lower.ends_with("-xhigh")
+        || model_lower.ends_with("-high")
         || model_lower.ends_with("-medium")
         || model_lower.ends_with("-low")
         || model_lower.ends_with("-extra-low");
@@ -2308,12 +2309,22 @@ pub async fn handle_chat_completions(
         client_budget
     };
 
-    let effort_hint: Option<String> = openai_req
+    let mut effort_hint: Option<String> = openai_req
         .reasoning_effort
         .as_ref()
         .map(|s| s.to_string())
         .or_else(|| openai_req.reasoning.as_ref().and_then(|r| r.effort.clone()))
         .or_else(|| openai_req.thinking.as_ref().and_then(|t| t.effort.clone()));
+
+    if effort_hint.is_none() {
+        if let Some(b) = raw_client_budget {
+            effort_hint = Some(crate::proxy::model_specs::effort_from_budget_tokens(b).to_string());
+        }
+    }
+
+    let route_effort =
+        crate::proxy::pipeline::routing_effort(client_switch.is_disabled(), effort_hint.as_deref());
+
     let canonical_model = openai_req.model.clone();
     // [ROUTE SINGLE ENTRY] 路由只由 router 决定；variant 仅根据已路由的物理模型解析 spec。
     openai_req.model = {
@@ -2321,7 +2332,7 @@ pub async fn handle_chat_completions(
         crate::proxy::common::model_mapping::resolve_model_route_with_effort(
             &openai_req.model,
             &mapping,
-            effort_hint.as_deref(),
+            route_effort,
         )
     };
     let variant_spec = crate::proxy::common::variant_mapping::resolve_spec_exact(
@@ -4359,7 +4370,13 @@ pub async fn handle_completions(
     // SignatureCache. OpenAI mapping ignores client/cached reasoning text and fills
     // placeholders via ThinkingStore hydrate + finalize instead.
 
-    let effort_hint = openai_req
+    let raw_client_budget = openai_req
+        .thinking
+        .as_ref()
+        .and_then(|t| t.budget_tokens)
+        .or_else(|| openai_req.reasoning.as_ref().and_then(|r| r.max_tokens));
+
+    let mut effort_hint = openai_req
         .reasoning_effort
         .as_deref()
         .or_else(|| {
@@ -4374,6 +4391,14 @@ pub async fn handle_completions(
                 .as_ref()
                 .and_then(|t| t.effort.as_deref())
         });
+
+    let derived_effort;
+    if effort_hint.is_none() {
+        if let Some(b) = raw_client_budget {
+            derived_effort = crate::proxy::model_specs::effort_from_budget_tokens(b);
+            effort_hint = Some(derived_effort);
+        }
+    }
 
     let route_effort = crate::proxy::pipeline::routing_effort(
         crate::proxy::pipeline::extract_client_thinking_switch(

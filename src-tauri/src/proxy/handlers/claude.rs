@@ -592,6 +592,8 @@ fn extract_thinking_hint(body: &Value) -> ThinkingHint {
         .and_then(|l| l.as_str())
     {
         hint.level = Some(level.to_lowercase());
+    } else if let Some(b) = hint.budget_tokens {
+        hint.level = Some(crate::proxy::model_specs::effort_from_budget_tokens(b).to_string());
     }
 
     hint
@@ -811,9 +813,21 @@ fn apply_variant(
     effort_tier: Option<crate::proxy::common::variant_mapping::VariantTier>,
     client_budget: Option<u32>,
 ) -> Option<crate::proxy::common::variant_mapping::RealModelSpec> {
+    let effective_tier = effort_tier.or_else(|| {
+        client_budget.and_then(|b| {
+            let tier = crate::proxy::common::variant_mapping::infer_tier(Some(b));
+            if crate::proxy::common::variant_mapping::resolve_real_model(&request.model, tier)
+                .is_some()
+            {
+                Some(tier)
+            } else {
+                None
+            }
+        })
+    });
     let spec = crate::proxy::common::variant_mapping::resolve_with_tier(
         &request.model,
-        effort_tier,
+        effective_tier,
         client_budget,
     )?;
     Some(apply_spec_to_request(request, spec, client_budget))
@@ -973,7 +987,8 @@ pub async fn handle_messages(
     // [Variant] Resolve canonical model + variant → real model + real params.
     let model_lower = request.model.to_lowercase();
     let is_v3_or_above = model_specs::is_gemini_v3_or_above(&request.model);
-    let is_explicit_tier_model = model_lower.ends_with("-high")
+    let is_explicit_tier_model = model_lower.ends_with("-xhigh")
+        || model_lower.ends_with("-high")
         || model_lower.ends_with("-medium")
         || model_lower.ends_with("-low")
         || model_lower.ends_with("-extra-low");
@@ -1028,7 +1043,12 @@ pub async fn handle_messages(
         .as_ref()
         .and_then(|config| config.effort.clone())
         .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.clone()))
-        .or_else(|| thinking_hint.level.clone());
+        .or_else(|| thinking_hint.level.clone())
+        .or_else(|| {
+            thinking_hint
+                .budget_tokens
+                .map(|b| crate::proxy::model_specs::effort_from_budget_tokens(b).to_string())
+        });
     let effort_hint =
         crate::proxy::pipeline::routing_effort(client_disabled, raw_effort.as_deref())
             .map(str::to_string);

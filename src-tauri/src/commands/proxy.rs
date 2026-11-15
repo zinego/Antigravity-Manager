@@ -172,6 +172,9 @@ pub async fn internal_start_proxy_service(
     token_manager
         .update_sticky_config(config.scheduling.clone())
         .await;
+    token_manager
+        .update_model_account_priority(config.model_account_priority.clone())
+        .await;
 
     // [NEW] 加载熔断配置 (从主配置加载)
     let app_config = crate::modules::config::load_app_config()
@@ -272,6 +275,9 @@ pub async fn ensure_admin_server(
     let app_data_dir = crate::modules::account::get_data_dir()?;
     let token_manager = Arc::new(TokenManager::new(app_data_dir));
     token_manager.set_qos_auto_jail(config.qos_auto_jail);
+    token_manager
+        .update_model_account_priority(config.model_account_priority.clone())
+        .await;
     // [NEW] 加载账号数据，否则管理界面统计为 0
     let _ = token_manager.load_accounts().await;
 
@@ -291,6 +297,7 @@ pub async fn ensure_admin_server(
         cloudflared_state,
         config.proxy_pool.clone(),
         config.only_raw_quota_models,
+        config.consolidate_tiered_models,
         config.image_scheduler.clone(),
     )
     .await

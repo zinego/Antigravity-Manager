@@ -40,6 +40,7 @@ import { AppleBentoView } from '../components/token_stats/AppleBentoView';
 import { CyberCockpitView } from '../components/token_stats/CyberCockpitView';
 import { PricingModal } from '../components/token_stats/PricingModal';
 import { ModelSpeedCard } from '../components/token_stats/ModelSpeedCard';
+import { ModelAccountFlowCard, ModelAccountDistributionResponse } from '../components/token_stats/ModelAccountFlowCard';
 
 export interface TokenStatsAggregated {
     period: string;
@@ -382,6 +383,7 @@ const TokenStats: React.FC = () => {
     const [allAccounts, setAllAccounts] = useState<string[]>([]);
     const [summary, setSummary] = useState<TokenStatsSummary | null>(null);
     const [speedData, setSpeedData] = useState<ModelSpeedResponse | null>(null);
+    const [distributionData, setDistributionData] = useState<ModelAccountDistributionResponse | null>(null);
     const [loading, setLoading] = useState(true);
 
     // 经典模式专属堆叠图数据
@@ -600,7 +602,7 @@ const TokenStats: React.FC = () => {
             setAccountTrendData(transformedAccountTrend);
 
             // 并行拉取账户统计、模型统计、全局概览、测速数据、经典看板堆叠数据，以及洞察看板的 91 天热力图与 24 小时柱状图
-            const [accounts, models_stats, summaryData, classicData, raw91Days, raw24Hours, speedDataRes] = await Promise.all([
+            const [accounts, models_stats, summaryData, classicData, raw91Days, raw24Hours, speedDataRes, distDataRes] = await Promise.all([
                 invoke<AccountTokenStats[]>('get_token_stats_by_account', { hours }),
                 invoke<ModelTokenStats[]>('get_token_stats_by_model', { hours, viewMode: modelPerspective }),
                 invoke<TokenStatsSummary>('get_token_stats_summary', { hours }),
@@ -608,12 +610,14 @@ const TokenStats: React.FC = () => {
                 invoke<TokenStatsAggregated[]>('get_token_stats_daily', { days: 91 }),
                 invoke<TokenStatsAggregated[]>('get_token_stats_hourly', { hours: 24 }),
                 invoke<ModelSpeedResponse>('get_token_stats_model_speed', { hours, buckets: 8, viewMode: modelPerspective }),
+                invoke<ModelAccountDistributionResponse>('get_token_stats_model_account_distribution', { hours, viewMode: modelPerspective }),
             ]);
 
             setAccountData(accounts);
             setModelData(models_stats);
             setSummary(summaryData);
             setSpeedData(speedDataRes);
+            setDistributionData(distDataRes || null);
 
             // 转换经典看板堆叠柱状图数据
             setClassicChartData(
@@ -1059,6 +1063,7 @@ const TokenStats: React.FC = () => {
                             setShowPricingModal={setShowPricingModal}
                         />
                         <ModelSpeedCard speedData={speedData} loading={loading} />
+                        <ModelAccountFlowCard data={distributionData} loading={loading} theme="cockpit" />
                     </div>
                 )}
 
@@ -1091,6 +1096,11 @@ const TokenStats: React.FC = () => {
                             customTooltip={CustomTrendTooltip}
                         />
                         <ModelSpeedCard speedData={speedData} loading={loading} />
+                        <ModelAccountFlowCard
+                            data={distributionData}
+                            loading={loading}
+                            theme={typeof document !== 'undefined' && document.documentElement.classList.contains('dark') ? 'dark' : 'light'}
+                        />
                     </div>
                 )}
 
@@ -1213,6 +1223,11 @@ const TokenStats: React.FC = () => {
                         )}
 
                         <ModelSpeedCard speedData={speedData} loading={loading} />
+                        <ModelAccountFlowCard
+                            data={distributionData}
+                            loading={loading}
+                            theme={typeof document !== 'undefined' && document.documentElement.classList.contains('dark') ? 'dark' : 'light'}
+                        />
 
                         {/* 全宽趋势图 (Full-Width Trend Chart) */}
                         <div className="bg-white dark:bg-base-100 rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-base-200 shadow-sm flex flex-col justify-between">

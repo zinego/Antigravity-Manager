@@ -33,6 +33,8 @@ export interface ProxyConfig {
     prompt_rewrite?: PromptRewriteConfig;
     image_thinking_mode?: 'enabled' | 'disabled'; // [NEW] 图像思维模式开关
     only_raw_quota_models?: boolean; // [NEW] 是否只暴露真实配额模型
+    consolidate_tiered_models?: boolean; // [NEW] 是否合并分档模型
+    model_account_priority?: Record<string, string[]>; // [NEW] 按模型配置的账号优先级队列
     proxy_pool?: ProxyPoolConfig;
     multimodal?: MultimodalConfig;
     stream_timeouts?: StreamTimeoutConfig;

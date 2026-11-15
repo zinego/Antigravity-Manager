@@ -30,6 +30,17 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     m
 });
 
+/// 官方档位后缀数组（按长度从长到短排序，防止前缀冲突，如 -extra-low 必须在 -low 之前，-xhigh 必须在 -high 之前）
+pub const TIER_STRIP_SUFFIXES: &[&str] = &[
+    "-extra-low",
+    "-xhigh",
+    "-high",
+    "-medium",
+    "-low",
+    "-thinking",
+    "-tiered",
+];
+
 /// 旧客户端仍在请求带点号的 Claude 版本（`claude-opus-4.6`、`claude-sonnet-4.5`、
 /// `claude-open-4.x`）。服务端目录只认连字符形态（`claude-opus-4-6` 等）。
 /// 这里只改写 Claude ID：去掉供应商标前缀，把短版本号里的点换成连字符。
@@ -380,18 +391,11 @@ pub async fn get_all_dynamic_models(
     }
 
     // 4. 动态档位后缀剥离与裸模型派生（纯通用数据驱动）：
-    // 若账号实际支持的模型包含分档或思考后缀（如 -high / -medium / -low / -extra-low / -tiered / -thinking），
-    // 自动剥离后缀并衍生对应的无后缀裸模型名（如 gemini-4-argon, gemini-3.8-flash, claude-opus-5-5, claude-sonnet-5-5, claude-opus-4-6, gpt-oss-120b）。
+    // 若账号实际支持的模型包含分档或思考后缀（如 -high / -medium / -low / -extra-low / -xhigh / -tiered / -thinking），
+    // 自动剥离后缀并衍生对应的无后缀裸模型名（如 gemini-4-argon, gemini-4-hydrogen, gemini-3.8-flash, claude-opus-5-5, claude-sonnet-5-5, claude-opus-4-6, gpt-oss-120b）。
     let mut derived_bare_models = HashSet::new();
     for id in &model_ids {
-        for suffix in &[
-            "-tiered",
-            "-high",
-            "-medium",
-            "-low",
-            "-extra-low",
-            "-thinking",
-        ] {
+        for suffix in TIER_STRIP_SUFFIXES {
             if let Some(base) = id.strip_suffix(suffix) {
                 if !base.is_empty()
                     && (is_model_compliant_with_baseline(base)
@@ -399,6 +403,7 @@ pub async fn get_all_dynamic_models(
                             && crate::modules::vertex::is_vertex_model_id_exposed(base)))
                 {
                     derived_bare_models.insert(base.to_string());
+                    break;
                 }
             }
         }
@@ -454,10 +459,11 @@ pub fn strip_image_variant_suffix(id: &str) -> String {
         "-1x1",
         "-3x4",
         "-4x3",
+        "-extra-low",
+        "-xhigh",
         "-high",
         "-medium",
         "-low",
-        "-extra-low",
         "-tiered",
     ];
     let mut base = id.trim().to_lowercase();
@@ -529,14 +535,7 @@ pub async fn get_all_dynamic_models_metadata(
     // 动态档位后缀剥离与裸模型元数据派生继承
     let mut derived_metas = std::collections::HashMap::new();
     for (name, meta) in &meta_map {
-        for suffix in &[
-            "-tiered",
-            "-high",
-            "-medium",
-            "-low",
-            "-extra-low",
-            "-thinking",
-        ] {
+        for suffix in TIER_STRIP_SUFFIXES {
             if let Some(base) = name.strip_suffix(suffix) {
                 if !base.is_empty()
                     && (is_model_compliant_with_baseline(base)
@@ -548,6 +547,7 @@ pub async fn get_all_dynamic_models_metadata(
                         m.display_name = Some(clean_tier_from_display_name(dn));
                     }
                     derived_metas.entry(base.to_string()).or_insert(m);
+                    break;
                 }
             }
         }
@@ -927,24 +927,26 @@ pub fn resolve_model_route_with_effort_and_pool(
     // 0 & 1 & 2. 优先匹配淘汰重定向与自定义映射（精确、大小写、规范化、通配符）
     if let Some(custom) = resolve_custom_model_route(original_model, custom_mapping) {
         // 自适应暗路由解析 (auto:*)
-        let target = if custom.starts_with("auto:") {
+        let is_auto = custom.starts_with("auto:");
+        let target = if is_auto {
             resolve_adaptive_target(&custom, original_model, client_effort, token_manager)
         } else {
             custom
         };
 
-        // 仅当客户端显式指定了有效非默认思考等级（如 effort=low/high）时，才允许对自定义目标进行显式等级调整；
-        // 未显式传等级时，100% 遵从用户的映射目标，严禁擅自将自定义目标降级到 tiered 或 medium！
+        // 仅当客户端显式指定了有效非默认思考等级（如 effort=low/high），
+        // 或者目标是由 auto:* 自适应暗路由解析出来的裸模型时，才对目标进行分档解析；
+        // 用户手写的显式静态自定义目标在未显式传等级时，100% 遵从用户的映射目标。
         let has_explicit_effort = client_effort
             .map(|s| s.trim())
             .filter(|s| !s.is_empty() && *s != "default")
             .is_some();
-        if has_explicit_effort {
+        if has_explicit_effort || is_auto {
             if let Some(routed) =
                 crate::proxy::model_specs::resolve_bare_tiered_model_route(&target, client_effort)
             {
                 crate::modules::logger::log_info(&format!(
-                    "[Router] 自定义映射目标依据显式思考档位路由: {} (target={}, effort={:?}) -> {}",
+                    "[Router] 自定义映射目标依据思考档位路由: {} (target={}, effort={:?}) -> {}",
                     original_model, target, client_effort, routed
                 ));
                 return map_claude_model_to_gemini(&routed);
@@ -998,6 +1000,52 @@ pub fn resolve_model_route_with_effort(
     client_effort: Option<&str>,
 ) -> String {
     resolve_model_route_with_effort_and_pool(original_model, custom_mapping, client_effort, None)
+}
+
+/// 整合展示模型 ID 列表：过滤掉已存在对应基底模型的分档变体（如已有 gemini-4-hydrogen 则隐藏 -low/-medium/-high/-xhigh 等），
+/// 除非在 custom_mapping_expose 中被显式配置为 true。
+pub fn consolidate_tiered_model_ids(
+    ids: Vec<String>,
+    _custom_mapping: &std::collections::HashMap<String, String>,
+    custom_mapping_expose: Option<&std::collections::HashMap<String, bool>>,
+) -> Vec<String> {
+    const SUFFIXES: &[&str] = &[
+        "-xhigh",
+        "-high",
+        "-medium",
+        "-low",
+        "-extra-low",
+        "-tiered",
+        "-thinking",
+    ];
+    let all_ids: std::collections::HashSet<String> = ids.iter().cloned().collect();
+    ids.into_iter()
+        .filter(|id| {
+            if let Some(expose) = custom_mapping_expose {
+                if expose
+                    .get(id)
+                    .copied()
+                    .or_else(|| expose.get(&id.to_lowercase()).copied())
+                    == Some(true)
+                {
+                    return true;
+                }
+            }
+            let lower = id.to_lowercase();
+            for suffix in SUFFIXES {
+                if let Some(base) = lower.strip_suffix(suffix) {
+                    if !base.is_empty()
+                        && all_ids
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(base))
+                    {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect()
 }
 
 /// Normalize any physical model name to one of the 3 standard protection IDs.
@@ -1791,5 +1839,73 @@ mod tests {
         if let Some(flash_meta) = meta_map.get("gemini-2.5-flash") {
             assert!(flash_meta.display_name.is_some() || flash_meta.supports_images.is_some());
         }
+    }
+
+    #[test]
+    fn test_gemini_4_hydrogen_bare_derivation_and_routing() {
+        // 1. gemini-4-hydrogen-xhigh 剥离后缀派生 gemini-4-hydrogen，绝不产生虚假的 gemini-4-hydrogen-x
+        assert_eq!(
+            strip_tier_suffix("gemini-4-hydrogen-xhigh"),
+            "gemini-4-hydrogen"
+        );
+        assert_eq!(
+            strip_tier_suffix("gemini-4-hydrogen-high"),
+            "gemini-4-hydrogen"
+        );
+        assert_eq!(
+            strip_tier_suffix("gemini-4-hydrogen-extra-low"),
+            "gemini-4-hydrogen"
+        );
+
+        let empty = HashMap::new();
+        // 2. 裸模型 gemini-4-hydrogen 思考档位路由
+        assert_eq!(
+            resolve_model_route_with_effort("gemini-4-hydrogen", &empty, Some("low")),
+            "gemini-4-hydrogen-low"
+        );
+        assert_eq!(
+            resolve_model_route_with_effort("gemini-4-hydrogen", &empty, Some("medium")),
+            "gemini-4-hydrogen-medium"
+        );
+        assert_eq!(
+            resolve_model_route_with_effort("gemini-4-hydrogen", &empty, Some("high")),
+            "gemini-4-hydrogen-high"
+        );
+        assert_eq!(
+            resolve_model_route_with_effort("gemini-4-hydrogen", &empty, Some("xhigh")),
+            "gemini-4-hydrogen-xhigh"
+        );
+        assert_eq!(
+            resolve_model_route_with_effort("gemini-4-hydrogen", &empty, Some("none")),
+            "gemini-4-hydrogen-low"
+        );
+    }
+
+    #[test]
+    fn test_consolidate_tiered_model_ids() {
+        let ids = vec![
+            "gemini-4-hydrogen".to_string(),
+            "gemini-4-hydrogen-low".to_string(),
+            "gemini-4-hydrogen-medium".to_string(),
+            "gemini-4-hydrogen-high".to_string(),
+            "gemini-4-hydrogen-xhigh".to_string(),
+        ];
+        let empty_custom = HashMap::new();
+        let mut expose = HashMap::new();
+
+        // 默认情况下全部折叠收敛为基底模型
+        let consolidated = consolidate_tiered_model_ids(ids.clone(), &empty_custom, Some(&expose));
+        assert_eq!(consolidated, vec!["gemini-4-hydrogen".to_string()]);
+
+        // 若用户显式暴露 high 档位，则保留显式暴露的键
+        expose.insert("gemini-4-hydrogen-high".to_string(), true);
+        let consolidated2 = consolidate_tiered_model_ids(ids.clone(), &empty_custom, Some(&expose));
+        assert_eq!(
+            consolidated2,
+            vec![
+                "gemini-4-hydrogen".to_string(),
+                "gemini-4-hydrogen-high".to_string()
+            ]
+        );
     }
 }

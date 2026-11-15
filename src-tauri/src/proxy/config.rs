@@ -1349,6 +1349,14 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub only_raw_quota_models: bool,
 
+    /// 是否在 /v1/models 中将分档模型（-low/-medium/-high/-xhigh）合并为单一基础模型对外暴露（默认开启）
+    #[serde(default = "default_true")]
+    pub consolidate_tiered_models: bool,
+
+    /// 按模型配置的账号优先级队列 (模型名 -> 账号ID列表)
+    #[serde(default)]
+    pub model_account_priority: HashMap<String, Vec<String>>,
+
     /// 自定义 User-Agent 请求头 (可选覆盖)
     #[serde(default)]
     pub user_agent_override: Option<String>,
@@ -1583,6 +1591,8 @@ impl Default for ProxyConfig {
             debug_logging: DebugLoggingConfig::default(),
             upstream_proxy: UpstreamProxyConfig::default(),
             only_raw_quota_models: false,
+            consolidate_tiered_models: true,
+            model_account_priority: HashMap::new(),
             scheduling: crate::proxy::sticky_config::StickySessionConfig::default(),
             experimental: ExperimentalConfig::default(),
             security_monitor: SecurityMonitorConfig::default(),
@@ -1896,5 +1906,37 @@ mod prompt_rewrite_config_tests {
             }],
         });
         assert!(get_prompt_rewriter().is_none());
+    }
+
+    #[test]
+    fn test_proxy_config_backward_compat() {
+        let minimal_json = r#"{
+            "enabled": true,
+            "port": 8045,
+            "api_key": "test",
+            "auto_start": false
+        }"#;
+        let config: ProxyConfig =
+            serde_json::from_str(minimal_json).expect("should deserialize minimal config");
+        assert!(config.consolidate_tiered_models);
+        assert!(config.model_account_priority.is_empty());
+
+        let explicit_json = r#"{
+            "enabled": true,
+            "port": 8045,
+            "api_key": "test",
+            "auto_start": false,
+            "consolidate_tiered_models": false,
+            "model_account_priority": {
+                "gemini-2.5-pro": ["acc-1", "acc-2"]
+            }
+        }"#;
+        let config_explicit: ProxyConfig =
+            serde_json::from_str(explicit_json).expect("should deserialize explicit config");
+        assert!(!config_explicit.consolidate_tiered_models);
+        assert_eq!(
+            config_explicit.model_account_priority.get("gemini-2.5-pro"),
+            Some(&vec!["acc-1".to_string(), "acc-2".to_string()])
+        );
     }
 }

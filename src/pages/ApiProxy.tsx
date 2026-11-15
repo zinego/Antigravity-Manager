@@ -42,6 +42,7 @@ import { CliSyncCard } from '../components/proxy/CliSyncCard';
 import { listAccounts } from '../services/accountService';
 import { motion } from 'framer-motion';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
+import { ModelAccountPriority } from '../components/settings/ModelAccountPriority';
 import GlobalSystemPrompt from '../components/settings/GlobalSystemPrompt';
 import SensitiveWordObfuscation from '../components/settings/SensitiveWordObfuscation';
 import PromptRewrite from '../components/settings/PromptRewrite';
@@ -227,7 +228,8 @@ export default function ApiProxy() {
 
     // [FIX #820] Fixed account mode states
     const [preferredAccountId, setPreferredAccountId] = useState<string | null>(null);
-    const [availableAccounts, setAvailableAccounts] = useState<Array<{ id: string; email: string }>>([]);
+    const [availableAccounts, setAvailableAccounts] = useState<any[]>([]);
+    const availableModelIds = useMemo(() => models.map(m => m.id), [models]);
 
     // Cloudflared (CF隧道) states
     const [cfStatus, setCfStatus] = useState<{ installed: boolean; version?: string; running: boolean; url?: string; error?: string }>({
@@ -414,7 +416,7 @@ export default function ApiProxy() {
     const loadAccounts = async () => {
         try {
             const accounts = await listAccounts();
-            setAvailableAccounts(accounts.map(a => ({ id: a.id, email: a.email })));
+            setAvailableAccounts(accounts);
         } catch (error) {
             console.error('Failed to load accounts:', error);
         }
@@ -1352,6 +1354,22 @@ print(response.choices[0].message.content)`;
                                     className="toggle toggle-sm bg-gray-300 dark:bg-gray-700 border-gray-400 dark:border-gray-600 checked:bg-blue-600 checked:border-blue-600 cursor-pointer"
                                     checked={appConfig.proxy.only_raw_quota_models ?? false}
                                     onChange={(e) => updateProxyConfig({ only_raw_quota_models: e.target.checked })}
+                                />
+                            </label>
+
+                            {/* 合并分档模型开关 */}
+                            <label
+                                className="flex items-center gap-2 px-3 py-1 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50/80 dark:bg-base-200 cursor-pointer hover:bg-gray-100 dark:hover:bg-base-300 transition-colors h-9 select-none"
+                                title={t('proxy.router.consolidate_tiered_models_tooltip', { defaultValue: 'Consolidate tiered models (-low, -medium, -high, -xhigh) into base canonical models in /v1/models' })}
+                            >
+                                <span className="text-xs font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap">
+                                    {t('proxy.router.consolidate_tiered_models', { defaultValue: 'Consolidate Tiered Models' })}
+                                </span>
+                                <input
+                                    type="checkbox"
+                                    className="toggle toggle-sm bg-gray-300 dark:bg-gray-700 border-gray-400 dark:border-gray-600 checked:bg-blue-600 checked:border-blue-600 cursor-pointer"
+                                    checked={appConfig.proxy.consolidate_tiered_models ?? true}
+                                    onChange={(e) => updateProxyConfig({ consolidate_tiered_models: e.target.checked })}
                                 />
                             </label>
 
@@ -3005,6 +3023,16 @@ print(response.choices[0].message.content)`;
                                                         {t('proxy.config.scheduling.start_proxy_first', { defaultValue: 'Start the proxy service to configure fixed account mode.' })}
                                                     </p>
                                                 )}
+                                            </div>
+
+                                            {/* 按模型账号优先级调度 */}
+                                            <div className="pt-2">
+                                                <ModelAccountPriority
+                                                    config={appConfig.proxy.model_account_priority || {}}
+                                                    accounts={availableAccounts}
+                                                    availableModels={availableModelIds}
+                                                    onChange={(next) => updateProxyConfig({ model_account_priority: next })}
+                                                />
                                             </div>
                                         </div>
                                     </div>

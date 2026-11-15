@@ -186,6 +186,97 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// 解析指定目标模型的账号优先级列表
+/// 优先精确匹配目标模型名；未命中时依次剥离档位后缀（如 -high/-low）、检查 Claude 规范化 ID 与 Gemini 上游映射
+pub fn resolve_model_account_priority_list(
+    map: &std::collections::HashMap<String, Vec<String>>,
+    target_model: &str,
+) -> Option<Vec<String>> {
+    let target_lower = target_model.trim().to_lowercase();
+    if target_lower.is_empty() {
+        return None;
+    }
+
+    // 1. 精确匹配完整模型名（含档位后缀，如 gemini-4-hydrogen-high）
+    if let Some(list) = map.get(&target_lower) {
+        if !list.is_empty() {
+            return Some(list.clone());
+        }
+    }
+
+    // 2. 剥离档位后缀匹配基名（如 gemini-4-hydrogen-high -> gemini-4-hydrogen）
+    let base_name = crate::proxy::common::model_mapping::strip_tier_suffix(&target_lower);
+    if base_name != target_lower {
+        if let Some(list) = map.get(&base_name) {
+            if !list.is_empty() {
+                return Some(list.clone());
+            }
+        }
+    }
+
+    // 3. 去除常见提供商前缀（anthropic/, models/）
+    let clean_model = target_lower
+        .strip_prefix("anthropic/")
+        .or_else(|| target_lower.strip_prefix("models/"))
+        .unwrap_or(&target_lower);
+    if clean_model != target_lower {
+        if let Some(list) = map.get(clean_model) {
+            if !list.is_empty() {
+                return Some(list.clone());
+            }
+        }
+        let clean_base = crate::proxy::common::model_mapping::strip_tier_suffix(clean_model);
+        if clean_base != clean_model {
+            if let Some(list) = map.get(&clean_base) {
+                if !list.is_empty() {
+                    return Some(list.clone());
+                }
+            }
+        }
+    }
+
+    // 4. Claude 客户端模型名标准化（如 claude-3.5-sonnet -> claude-3-5-sonnet）
+    let canonical_claude =
+        crate::proxy::common::model_mapping::canonicalize_claude_client_model_id(&target_lower);
+    if canonical_claude != target_lower {
+        if let Some(list) = map.get(&canonical_claude) {
+            if !list.is_empty() {
+                return Some(list.clone());
+            }
+        }
+        let canonical_base =
+            crate::proxy::common::model_mapping::strip_tier_suffix(&canonical_claude);
+        if canonical_base != canonical_claude {
+            if let Some(list) = map.get(&canonical_base) {
+                if !list.is_empty() {
+                    return Some(list.clone());
+                }
+            }
+        }
+    }
+
+    // 5. Claude -> Gemini 上游内部路由模型名映射
+    let mapped_gemini =
+        crate::proxy::common::model_mapping::map_claude_model_to_gemini(&target_lower);
+    if mapped_gemini != target_lower && mapped_gemini != canonical_claude {
+        if let Some(list) = map.get(&mapped_gemini) {
+            if !list.is_empty() {
+                return Some(list.clone());
+            }
+        }
+        let mapped_base = crate::proxy::common::model_mapping::strip_tier_suffix(&mapped_gemini);
+        if mapped_base != mapped_gemini {
+            if let Some(list) = map.get(&mapped_base) {
+                if !list.is_empty() {
+                    return Some(list.clone());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 pub struct TokenManager {
     tokens: Arc<DashMap<String, ProxyToken>>, // account_id -> ProxyToken
     current_index: Arc<AtomicUsize>,
@@ -195,7 +286,9 @@ pub struct TokenManager {
     sticky_config: Arc<tokio::sync::RwLock<StickySessionConfig>>, // 新增：调度配置
     session_accounts: Arc<DashMap<String, String>>, // 新增：会话与账号映射 (SessionID -> AccountID)
     preferred_account_id: Arc<tokio::sync::RwLock<Option<String>>>, // [FIX #820] 优先使用的账号ID（固定账号模式）
-    health_scores: Arc<DashMap<String, f32>>,                       // account_id -> health_score
+    model_account_priority:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Vec<String>>>>,
+    health_scores: Arc<DashMap<String, f32>>, // account_id -> health_score
     circuit_breaker_config: Arc<tokio::sync::RwLock<crate::models::CircuitBreakerConfig>>, // [NEW] 熔断配置缓存
 
     // [NEW] 按账号分配的同步刷新锁。
@@ -251,6 +344,9 @@ impl TokenManager {
             sticky_config: Arc::new(tokio::sync::RwLock::new(StickySessionConfig::default())),
             session_accounts: Arc::new(DashMap::new()),
             preferred_account_id: Arc::new(tokio::sync::RwLock::new(None)), // [FIX #820]
+            model_account_priority: Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             health_scores: Arc::new(DashMap::new()),
             circuit_breaker_config: Arc::new(tokio::sync::RwLock::new(
                 crate::models::CircuitBreakerConfig::default(),
@@ -2466,8 +2562,8 @@ impl TokenManager {
             .replace("-extra-low", "")
             .replace("-low", "")
             .replace("-medium", "")
-            .replace("-high", "")
             .replace("-xhigh", "")
+            .replace("-high", "")
             .replace("-thinking", "")
             .replace("-tiered", "")
             .replace("@default", "");
@@ -2557,7 +2653,8 @@ impl TokenManager {
         target_model: &str,
         normalized_target: &str,
     ) -> i32 {
-        Self::find_effective_quota(token, target_model, normalized_target).unwrap_or(0)
+        Self::find_effective_quota(token, target_model, normalized_target)
+            .unwrap_or_else(|| token.remaining_quota.unwrap_or(0))
     }
 
     /// * `target_model` - 原始目标模型名
@@ -3367,6 +3464,163 @@ impl TokenManager {
         let quota_protection_enabled = crate::modules::config::load_app_config()
             .map(|cfg| cfg.quota_protection.enabled)
             .unwrap_or(false);
+
+        // ===== [Per-Model Account Priority] 按模型账号优先级选择 =====
+        let priority_ids_opt = {
+            let priority_map = self.model_account_priority.read().await;
+            resolve_model_account_priority_list(&priority_map, target_model)
+        };
+
+        if let Some(priority_ids) = priority_ids_opt {
+            if !priority_ids.is_empty() {
+                let mut found_priority_token: Option<ProxyToken> = None;
+                for acc_id in &priority_ids {
+                    // 1. 在 tokens_snapshot 中寻找匹配账号（已被 excluded_accounts、validation_blocked、不支持模型等预先过滤）
+                    let preferred_token =
+                        match tokens_snapshot.iter().find(|t| &t.account_id == acc_id) {
+                            Some(t) => t.clone(),
+                            None => continue,
+                        };
+
+                    // 2. 磁盘状态检查（排除已禁用的账号）
+                    let disk_state =
+                        Self::get_account_state_on_disk(&preferred_token.account_path).await;
+                    if disk_state == OnDiskAccountState::Disabled {
+                        tracing::warn!(
+                            "🎯 [Model Priority] Account {} ({}) is disabled on disk, skipping",
+                            preferred_token.email,
+                            acc_id
+                        );
+                        continue;
+                    }
+
+                    // 3. 限流检查
+                    if self
+                        .is_rate_limited(&preferred_token.account_id, Some(&normalized_target))
+                        .await
+                    {
+                        tracing::warn!(
+                            "🎯 [Model Priority] Account {} ({}) is rate-limited for {}, skipping",
+                            preferred_token.email,
+                            acc_id,
+                            normalized_target
+                        );
+                        continue;
+                    }
+
+                    // 4. QoS 熔断/隔离状态检查
+                    if self
+                        .qos_guardian
+                        .is_jailed_or_probing(&preferred_token.account_id)
+                    {
+                        tracing::warn!(
+                            "🎯 [Model Priority] Account {} ({}) is jailed in QoS Guardian, skipping",
+                            preferred_token.email,
+                            acc_id
+                        );
+                        continue;
+                    }
+
+                    // 5. 配额保护检查
+                    let is_quota_protected = quota_protection_enabled
+                        && preferred_token
+                            .protected_models
+                            .contains(&normalized_target);
+                    if is_quota_protected {
+                        tracing::warn!(
+                            "🎯 [Model Priority] Account {} ({}) is quota-protected for {}, skipping",
+                            preferred_token.email,
+                            acc_id,
+                            normalized_target
+                        );
+                        continue;
+                    }
+
+                    // 6. 有效配额检查（若配额 <= 0 则跳过）
+                    let effective_quota = Self::find_effective_quota(
+                        &preferred_token,
+                        target_model,
+                        &normalized_target,
+                    );
+                    if let Some(q) = effective_quota {
+                        if q <= 0 {
+                            tracing::warn!(
+                                "🎯 [Model Priority] Account {} ({}) has 0% quota for {}, skipping",
+                                preferred_token.email,
+                                acc_id,
+                                target_model
+                            );
+                            continue;
+                        }
+                    }
+
+                    // 命中首个健康、可用的优先账号
+                    found_priority_token = Some(preferred_token);
+                    break;
+                }
+
+                if let Some(preferred_token) = found_priority_token {
+                    tracing::info!(
+                        "🎯 [Model Priority] Using configured priority account: {} ({}) for model {}",
+                        preferred_token.email,
+                        preferred_token.account_id,
+                        target_model
+                    );
+
+                    let mut token = preferred_token;
+
+                    // 检查 token 是否过期（提前 300 秒平滑刷新，并应用 3.5s 超时安全管控）
+                    const TOKEN_REFRESH_BUFFER_SECS: i64 = 300;
+                    let now = chrono::Utc::now().timestamp();
+                    if now >= token.timestamp - TOKEN_REFRESH_BUFFER_SECS {
+                        let hot_path_timeout = std::time::Duration::from_millis(3500);
+                        match self
+                            .refresh_account_token_with_timeout(
+                                &token.account_id,
+                                TOKEN_REFRESH_BUFFER_SECS,
+                                hot_path_timeout,
+                            )
+                            .await
+                        {
+                            Ok(refreshed) => {
+                                token = refreshed;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Model priority account token refresh failed ({}): {}，继续尝试或回退",
+                                    token.email,
+                                    e
+                                );
+                            }
+                        }
+                    }
+
+                    // 确保有 project_id
+                    let hot_path_timeout = std::time::Duration::from_millis(3500);
+                    let project_id = self
+                        .resolve_project_id_with_timeout(
+                            &token.account_id,
+                            &token.access_token,
+                            &token.account_path,
+                            hot_path_timeout,
+                        )
+                        .await;
+
+                    return Ok((
+                        token.access_token,
+                        project_id,
+                        token.email,
+                        token.account_id,
+                        0,
+                    ));
+                } else {
+                    tracing::info!(
+                        "🎯 [Model Priority] No configured priority account available for model {}, falling back to standard pool",
+                        target_model
+                    );
+                }
+            }
+        }
 
         // ===== [FIX #820] 固定账号模式：优先使用指定账号 =====
         let preferred_id = self.preferred_account_id.read().await.clone();
@@ -4295,8 +4549,8 @@ impl TokenManager {
             .replace("-extra-low", "")
             .replace("-low", "")
             .replace("-medium", "")
-            .replace("-high", "")
             .replace("-xhigh", "")
+            .replace("-high", "")
             .replace("-thinking", "")
             .replace("-tiered", "")
             .replace("@default", "");
@@ -4322,8 +4576,8 @@ impl TokenManager {
             .replace("-extra-low", "")
             .replace("-low", "")
             .replace("-medium", "")
-            .replace("-high", "")
             .replace("-xhigh", "")
+            .replace("-high", "")
             .replace("-thinking", "")
             .replace("-tiered", "")
             .replace("@default", "");
@@ -4548,6 +4802,17 @@ impl TokenManager {
                         });
                     if has_3p_positive.is_some() {
                         return true;
+                    }
+                    // 3P 明确配额耗尽为 0 时直接返回 false（例如 claude: 0 或具体模型: 0）
+                    let is_explicitly_zero = token.model_quotas.get(model).is_some_and(|&q| q <= 0)
+                        || token
+                            .model_quotas
+                            .get(&model_lower)
+                            .is_some_and(|&q| q <= 0)
+                        || token.model_quotas.get(&normalized).is_some_and(|&q| q <= 0)
+                        || token.model_quotas.get("claude").is_some_and(|&q| q <= 0);
+                    if is_explicitly_zero {
+                        return false;
                     }
                     // 【FIX】3P 桶耗尽时不要立即判死：若账号在 available_models 中仍持有该模型授权
                     // 且未被限流，仍允许调度（最终鉴权交上游）。否则单个 3P 模型被标记 0% 后，
@@ -5996,6 +6261,41 @@ impl TokenManager {
         self.session_accounts.clear();
     }
 
+    // ===== [Per-Model Account Priority] 按模型账号优先级方法 =====
+
+    /// 更新按模型配置的账号优先级队列
+    /// 会将所有模型键归一化为 trimmed 小写，同时严格保留账号 ID 队列的配置顺序
+    pub async fn update_model_account_priority(
+        &self,
+        map: std::collections::HashMap<String, Vec<String>>,
+    ) {
+        let normalized: std::collections::HashMap<String, Vec<String>> = map
+            .into_iter()
+            .map(|(k, v)| (k.trim().to_lowercase(), v))
+            .collect();
+        let mut priority = self.model_account_priority.write().await;
+        *priority = normalized;
+        tracing::info!(
+            "🎯 [Model Priority] Updated model_account_priority ({} models configured)",
+            priority.len()
+        );
+    }
+
+    /// 获取当前按模型配置的账号优先级队列
+    pub async fn get_model_account_priority(
+        &self,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        self.model_account_priority.read().await.clone()
+    }
+
+    /// 解析指定目标模型的账号优先级列表
+    pub fn resolve_model_account_priority_list(
+        map: &std::collections::HashMap<String, Vec<String>>,
+        target_model: &str,
+    ) -> Option<Vec<String>> {
+        resolve_model_account_priority_list(map, target_model)
+    }
+
     // ===== [FIX #820] 固定账号模式相关方法 =====
 
     /// 设置优先使用的账号ID（固定账号模式）
@@ -6679,22 +6979,19 @@ impl TokenManager {
                                 "gemini-4-argon-low",
                             ]
                         } else if third_party {
-                            let has_3p = quota
-                                .get("models")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter().any(|m| {
-                                        let n = m
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_lowercase();
-                                        !n.contains("-disabled")
-                                            && !n.ends_with("_disabled")
-                                            && (n.starts_with("claude") || n.starts_with("gpt"))
-                                    })
-                                })
-                                .unwrap_or(false);
+                            let has_3p = match quota.get("models").and_then(|v| v.as_array()) {
+                                Some(arr) => arr.iter().any(|m| {
+                                    let n = m
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_lowercase();
+                                    !n.contains("-disabled")
+                                        && !n.ends_with("_disabled")
+                                        && (n.starts_with("claude") || n.starts_with("gpt"))
+                                }),
+                                None => true,
+                            };
                             if has_3p {
                                 vec!["claude"]
                             } else {
@@ -11265,5 +11562,213 @@ mod tests {
         );
 
         manager.remove_account(&vertex_id);
+    }
+
+    #[test]
+    fn test_resolve_model_account_priority_list() {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        map.insert(
+            "gemini-4-hydrogen".to_string(),
+            vec!["acc_base_1".to_string(), "acc_base_2".to_string()],
+        );
+        map.insert(
+            "gemini-4-hydrogen-high".to_string(),
+            vec!["acc_high_1".to_string()],
+        );
+        map.insert(
+            "claude-opus-5".to_string(),
+            vec!["acc_claude_opus".to_string()],
+        );
+
+        // 1. 精确匹配优先：gemini-4-hydrogen-high 命中专属列表
+        let high_match =
+            TokenManager::resolve_model_account_priority_list(&map, "gemini-4-hydrogen-high");
+        assert_eq!(high_match, Some(vec!["acc_high_1".to_string()]));
+
+        // 2. 基底回退：gemini-4-hydrogen-low 没有专属规则，回退到 gemini-4-hydrogen
+        let low_fallback =
+            TokenManager::resolve_model_account_priority_list(&map, "gemini-4-hydrogen-low");
+        assert_eq!(
+            low_fallback,
+            Some(vec!["acc_base_1".to_string(), "acc_base_2".to_string()])
+        );
+
+        // 3. 变体后缀剥离回退：gemini-4-hydrogen-xhigh 回退到基底
+        let xhigh_fallback =
+            TokenManager::resolve_model_account_priority_list(&map, "gemini-4-hydrogen-xhigh");
+        assert_eq!(
+            xhigh_fallback,
+            Some(vec!["acc_base_1".to_string(), "acc_base_2".to_string()])
+        );
+
+        // 4. Claude 客户端模型名标准化与基底回退
+        let claude_match =
+            TokenManager::resolve_model_account_priority_list(&map, "anthropic/claude-opus-5-high");
+        assert_eq!(claude_match, Some(vec!["acc_claude_opus".to_string()]));
+
+        // 5. 空白或未配置模型返回 None
+        assert_eq!(
+            TokenManager::resolve_model_account_priority_list(&map, "   "),
+            None
+        );
+        assert_eq!(
+            TokenManager::resolve_model_account_priority_list(&map, "unconfigured-model"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_account_priority_routing_and_failover() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+        let target_model = "gemini-4-hydrogen-high";
+
+        // 创建三个账号的物理文件，确保 get_account_state_on_disk 返回 Enabled
+        let path_a = temp_dir.path().join("acc_a.json");
+        let path_b = temp_dir.path().join("acc_b.json");
+        let path_c = temp_dir.path().join("acc_c.json");
+        std::fs::write(&path_a, r#"{"disabled":false}"#).unwrap();
+        std::fs::write(&path_b, r#"{"disabled":false}"#).unwrap();
+        std::fs::write(&path_c, r#"{"disabled":false}"#).unwrap();
+
+        let mut token_a = create_test_token("a@test.com", Some("PRO"), 1.0, None, Some(90));
+        token_a.account_id = "acc_a".to_string();
+        token_a.account_path = path_a;
+        token_a
+            .available_models
+            .insert("gemini-4-hydrogen".to_string());
+        token_a
+            .available_models
+            .insert("gemini-4-hydrogen-high".to_string());
+        token_a
+            .model_quotas
+            .insert("gemini-4-hydrogen".to_string(), 90);
+        token_a
+            .model_quotas
+            .insert("gemini-4-hydrogen-high".to_string(), 90);
+
+        let mut token_b = create_test_token("b@test.com", Some("PRO"), 1.0, None, Some(80));
+        token_b.account_id = "acc_b".to_string();
+        token_b.account_path = path_b;
+        token_b
+            .available_models
+            .insert("gemini-4-hydrogen".to_string());
+        token_b
+            .available_models
+            .insert("gemini-4-hydrogen-high".to_string());
+        token_b
+            .model_quotas
+            .insert("gemini-4-hydrogen".to_string(), 80);
+        token_b
+            .model_quotas
+            .insert("gemini-4-hydrogen-high".to_string(), 80);
+
+        let mut token_c = create_test_token("c@test.com", Some("PRO"), 1.0, None, Some(70));
+        token_c.account_id = "acc_c".to_string();
+        token_c.account_path = path_c;
+        token_c
+            .available_models
+            .insert("gemini-4-hydrogen".to_string());
+        token_c
+            .available_models
+            .insert("gemini-4-hydrogen-high".to_string());
+        token_c
+            .model_quotas
+            .insert("gemini-4-hydrogen".to_string(), 70);
+        token_c
+            .model_quotas
+            .insert("gemini-4-hydrogen-high".to_string(), 70);
+
+        manager.tokens.insert("acc_a".to_string(), token_a);
+        manager.tokens.insert("acc_b".to_string(), token_b);
+        manager.tokens.insert("acc_c".to_string(), token_c);
+
+        // 配置优先级：对 gemini-4-hydrogen 配置 [acc_a, acc_b]，acc_c 作为通用池保底
+        let mut priority_config = HashMap::new();
+        priority_config.insert(
+            "gemini-4-hydrogen".to_string(),
+            vec!["acc_a".to_string(), "acc_b".to_string()],
+        );
+        manager.update_model_account_priority(priority_config).await;
+
+        let empty_excluded = HashSet::new();
+
+        // 场景 1: 所有账号健康，严格选中优先级第 1 位的 acc_a
+        let (_, _, email1, id1, _) = manager
+            .get_token_filtered("gemini", false, None, target_model, &empty_excluded)
+            .await
+            .unwrap();
+        assert_eq!(id1, "acc_a");
+        assert_eq!(email1, "a@test.com");
+
+        // 场景 2: acc_a 处于 excluded_accounts（例如在当前请求中重试），顺延选中优先级第 2 位的 acc_b
+        let mut excluded = HashSet::new();
+        excluded.insert("acc_a".to_string());
+        let (_, _, email2, id2, _) = manager
+            .get_token_filtered("gemini", false, None, target_model, &excluded)
+            .await
+            .unwrap();
+        assert_eq!(id2, "acc_b");
+        assert_eq!(email2, "b@test.com");
+
+        // 场景 3: acc_a 遭遇限流或 0% 配额，自动切换到 acc_b
+        manager.rate_limit_tracker.set_lockout_until(
+            "acc_a",
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
+            Some("gemini-4-hydrogen".to_string()),
+        );
+        let (_, _, email3, id3, _) = manager
+            .get_token_filtered("gemini", false, None, target_model, &empty_excluded)
+            .await
+            .unwrap();
+        assert_eq!(id3, "acc_b");
+        assert_eq!(email3, "b@test.com");
+
+        // 场景 4: acc_a 与 acc_b 均耗尽/限流，无缝回退到队列外的池中健康账号 acc_c
+        manager.rate_limit_tracker.set_lockout_until(
+            "acc_b",
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
+            Some("gemini-4-hydrogen".to_string()),
+        );
+        let (_, _, email4, id4, _) = manager
+            .get_token_filtered("gemini", false, None, target_model, &empty_excluded)
+            .await
+            .unwrap();
+        assert_eq!(id4, "acc_c", "优先级队列全不可用时必须无缝回退到通用池账号");
+        assert_eq!(email4, "c@test.com");
+
+        // 场景 5: 全池账号均被排除时，返回错误
+        let mut all_excluded = HashSet::new();
+        all_excluded.insert("acc_a".to_string());
+        all_excluded.insert("acc_b".to_string());
+        all_excluded.insert("acc_c".to_string());
+        let res_err = manager
+            .get_token_filtered("gemini", false, None, target_model, &all_excluded)
+            .await;
+        assert!(res_err.is_err());
+    }
+
+    #[test]
+    fn test_token_supports_advanced_model_xhigh_order() {
+        let mut token = create_test_token("xhigh@example.com", Some("PRO"), 1.0, None, Some(100));
+        token
+            .model_limits
+            .insert("gemini-4-hydrogen".to_string(), 65536);
+
+        // 必须正确识别 -xhigh 后缀（确保不会被 -high 提前误替换为 -x）
+        assert!(TokenManager::token_supports_advanced_model(
+            &token,
+            "gemini-4-hydrogen-xhigh"
+        ));
+        assert!(TokenManager::token_supports_advanced_model(
+            &token,
+            "gemini-4-hydrogen-high"
+        ));
+        assert!(TokenManager::token_supports_advanced_model(
+            &token,
+            "gemini-4-hydrogen-extra-low"
+        ));
     }
 }

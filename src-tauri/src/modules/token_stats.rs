@@ -120,6 +120,33 @@ pub struct ModelSpeedResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountDistributionSlice {
+    pub account_email: String,
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub total_tokens: u64,
+    pub request_share_pct: f64,
+    pub token_share_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelAccountDistributionItem {
+    pub model: String,
+    pub total_requests: u64,
+    pub total_tokens: u64,
+    pub accounts: Vec<AccountDistributionSlice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelAccountDistributionResponse {
+    pub total_requests: u64,
+    pub total_tokens: u64,
+    pub models: Vec<ModelAccountDistributionItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelTrendPoint {
     pub period: String,
     pub model_data: std::collections::HashMap<String, u64>,
@@ -1417,6 +1444,160 @@ pub(crate) fn get_model_speed_stats_with_conn(
     })
 }
 
+/// Query token distribution per model and account
+pub fn get_model_account_distribution(
+    hours: i64,
+    view_mode: Option<&str>,
+) -> Result<ModelAccountDistributionResponse, String> {
+    let conn = connect_db()?;
+    get_model_account_distribution_with_conn(&conn, hours, view_mode)
+}
+
+pub(crate) fn get_model_account_distribution_with_conn(
+    conn: &Connection,
+    hours: i64,
+    view_mode: Option<&str>,
+) -> Result<ModelAccountDistributionResponse, String> {
+    let cutoff = if hours <= 0 {
+        0
+    } else {
+        chrono::Local::now().timestamp() - (hours * 3600)
+    };
+
+    let model_expr = model_column_expr(view_mode);
+    let sql = format!(
+        "SELECT {col} as agg_model,
+                account_email,
+                COUNT(*) as request_count,
+                COALESCE(SUM(input_tokens), 0) as input_tokens,
+                COALESCE(SUM(output_tokens), 0) as output_tokens,
+                COALESCE(SUM(cached_tokens), 0) as cached_tokens,
+                COALESCE(SUM(total_tokens), 0) as total_tokens
+         FROM token_usage
+         WHERE timestamp >= ?1
+         GROUP BY agg_model, account_email",
+        col = model_expr
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+
+    struct RawAccountRow {
+        account_email: String,
+        request_count: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        total_tokens: u64,
+    }
+
+    let mut model_map: std::collections::BTreeMap<String, Vec<RawAccountRow>> =
+        std::collections::BTreeMap::new();
+
+    let rows = stmt
+        .query_map([cutoff], |row| {
+            let model = row
+                .get::<_, Option<String>>(0)?
+                .unwrap_or_else(|| "unknown".to_string());
+            let account_email = row
+                .get::<_, Option<String>>(1)?
+                .unwrap_or_else(|| "unknown".to_string());
+            let request_count = row.get::<_, i64>(2).unwrap_or(0).max(0) as u64;
+            let input_tokens = row.get::<_, i64>(3).unwrap_or(0).max(0) as u64;
+            let output_tokens = row.get::<_, i64>(4).unwrap_or(0).max(0) as u64;
+            let cached_tokens = row.get::<_, i64>(5).unwrap_or(0).max(0) as u64;
+            let total_tokens = row.get::<_, i64>(6).unwrap_or(0).max(0) as u64;
+
+            Ok((
+                model,
+                RawAccountRow {
+                    account_email,
+                    request_count,
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                    total_tokens,
+                },
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in rows {
+        let (model, raw_acc) = row.map_err(|e| e.to_string())?;
+        model_map.entry(model).or_default().push(raw_acc);
+    }
+
+    let mut models = Vec::new();
+    let mut grand_total_requests: u64 = 0;
+    let mut grand_total_tokens: u64 = 0;
+
+    for (model, raw_accounts) in model_map {
+        let model_total_requests: u64 = raw_accounts.iter().map(|a| a.request_count).sum();
+        let model_total_tokens: u64 = raw_accounts.iter().map(|a| a.total_tokens).sum();
+
+        grand_total_requests += model_total_requests;
+        grand_total_tokens += model_total_tokens;
+
+        let mut accounts: Vec<AccountDistributionSlice> = raw_accounts
+            .into_iter()
+            .map(|a| {
+                let request_share_pct = if model_total_requests > 0 {
+                    (((a.request_count as f64 / model_total_requests as f64) * 10000.0).round())
+                        / 100.0
+                } else {
+                    0.0
+                }
+                .clamp(0.0, 100.0);
+
+                let token_share_pct = if model_total_tokens > 0 {
+                    (((a.total_tokens as f64 / model_total_tokens as f64) * 10000.0).round())
+                        / 100.0
+                } else {
+                    0.0
+                }
+                .clamp(0.0, 100.0);
+
+                AccountDistributionSlice {
+                    account_email: a.account_email,
+                    request_count: a.request_count,
+                    input_tokens: a.input_tokens,
+                    output_tokens: a.output_tokens,
+                    cached_tokens: a.cached_tokens,
+                    total_tokens: a.total_tokens,
+                    request_share_pct,
+                    token_share_pct,
+                }
+            })
+            .collect();
+
+        accounts.sort_by(|a, b| {
+            b.total_tokens
+                .cmp(&a.total_tokens)
+                .then_with(|| b.request_count.cmp(&a.request_count))
+                .then_with(|| a.account_email.cmp(&b.account_email))
+        });
+
+        models.push(ModelAccountDistributionItem {
+            model,
+            total_requests: model_total_requests,
+            total_tokens: model_total_tokens,
+            accounts,
+        });
+    }
+
+    models.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then_with(|| b.total_requests.cmp(&a.total_requests))
+            .then_with(|| a.model.cmp(&b.model))
+    });
+
+    Ok(ModelAccountDistributionResponse {
+        total_requests: grand_total_requests,
+        total_tokens: grand_total_tokens,
+        models,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1691,5 +1872,113 @@ mod tests {
         assert_eq!(model_a.min_tps, 50.0);
         assert_eq!(model_a.max_tps, 100.0);
         assert_eq!(model_a.avg_ttft_ms, Some(300.0));
+    }
+
+    #[test]
+    fn test_model_account_distribution() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                account_email TEXT NOT NULL,
+                model TEXT NOT NULL,
+                requested_model TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                ttft_ms REAL,
+                duration_ms REAL
+            );",
+        )
+        .unwrap();
+
+        let base_ts = 1_700_000_000;
+
+        // Model flash (requested: claude-haiku):
+        // Account A: 300 input + 100 output + 100 cached = 500 total, 1 req
+        conn.execute(
+            "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens)
+             VALUES (?1, 'acc_a@example.com', 'gemini-flash', 'claude-haiku', 300, 100, 100, 0, 500)",
+            params![base_ts + 10],
+        ).unwrap();
+
+        // Account B: 1200 input + 300 output + 0 cached = 1500 total, 1 req
+        conn.execute(
+            "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens)
+             VALUES (?1, 'acc_b@example.com', 'gemini-flash', 'claude-haiku', 1200, 300, 0, 0, 1500)",
+            params![base_ts + 20],
+        ).unwrap();
+
+        // Model pro (requested: claude-sonnet):
+        // Account A: 2000 input + 1000 output + 0 cached = 3000 total, 1 req
+        conn.execute(
+            "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens)
+             VALUES (?1, 'acc_a@example.com', 'gemini-pro', 'claude-sonnet', 2000, 1000, 0, 0, 3000)",
+            params![base_ts + 30],
+        ).unwrap();
+
+        // Test 1: Routed view (view_mode = None)
+        let res_routed = get_model_account_distribution_with_conn(&conn, 0, None).unwrap();
+        assert_eq!(res_routed.total_requests, 3);
+        assert_eq!(res_routed.total_tokens, 5000);
+        assert_eq!(res_routed.models.len(), 2);
+
+        // Sorted by total_tokens DESC: gemini-pro (3000) > gemini-flash (2000)
+        let pro = &res_routed.models[0];
+        assert_eq!(pro.model, "gemini-pro");
+        assert_eq!(pro.total_tokens, 3000);
+        assert_eq!(pro.total_requests, 1);
+        assert_eq!(pro.accounts.len(), 1);
+        assert_eq!(pro.accounts[0].account_email, "acc_a@example.com");
+        assert_eq!(pro.accounts[0].token_share_pct, 100.0);
+        assert_eq!(pro.accounts[0].request_share_pct, 100.0);
+
+        let flash = &res_routed.models[1];
+        assert_eq!(flash.model, "gemini-flash");
+        assert_eq!(flash.total_tokens, 2000);
+        assert_eq!(flash.total_requests, 2);
+        assert_eq!(flash.accounts.len(), 2);
+        // Within flash: acc_b (1500 tokens, 75.0%) > acc_a (500 tokens, 25.0%)
+        assert_eq!(flash.accounts[0].account_email, "acc_b@example.com");
+        assert_eq!(flash.accounts[0].total_tokens, 1500);
+        assert_eq!(flash.accounts[0].token_share_pct, 75.0);
+        assert_eq!(flash.accounts[0].request_share_pct, 50.0);
+        assert_eq!(flash.accounts[1].account_email, "acc_a@example.com");
+        assert_eq!(flash.accounts[1].total_tokens, 500);
+        assert_eq!(flash.accounts[1].token_share_pct, 25.0);
+        assert_eq!(flash.accounts[1].request_share_pct, 50.0);
+
+        // Test 2: Requested view (view_mode = Some("requested"))
+        let res_requested =
+            get_model_account_distribution_with_conn(&conn, 0, Some("requested")).unwrap();
+        assert_eq!(res_requested.total_requests, 3);
+        assert_eq!(res_requested.total_tokens, 5000);
+        assert_eq!(res_requested.models.len(), 2);
+
+        // Models should be "claude-sonnet" (3000) and "claude-haiku" (2000)
+        assert_eq!(res_requested.models[0].model, "claude-sonnet");
+        assert_eq!(res_requested.models[0].total_tokens, 3000);
+        assert_eq!(res_requested.models[1].model, "claude-haiku");
+        assert_eq!(res_requested.models[1].total_tokens, 2000);
+
+        // Within claude-haiku: acc_b (1500 tokens, 75.0%) > acc_a (500 tokens, 25.0%)
+        let haiku = &res_requested.models[1];
+        assert_eq!(haiku.accounts[0].account_email, "acc_b@example.com");
+        assert_eq!(haiku.accounts[0].token_share_pct, 75.0);
+        assert_eq!(haiku.accounts[1].account_email, "acc_a@example.com");
+        assert_eq!(haiku.accounts[1].token_share_pct, 25.0);
+
+        // Check fallback when requested_model is empty/NULL: defaults back to model
+        conn.execute(
+            "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens)
+             VALUES (?1, 'acc_c@example.com', 'gpt-4o', '', 100, 100, 0, 0, 200)",
+            params![base_ts + 40],
+        ).unwrap();
+        let res_fallback =
+            get_model_account_distribution_with_conn(&conn, 0, Some("requested")).unwrap();
+        assert!(res_fallback.models.iter().any(|m| m.model == "gpt-4o"));
     }
 }

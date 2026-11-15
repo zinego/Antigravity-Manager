@@ -895,6 +895,7 @@ pub fn run() {
             commands::get_token_stats_by_account,
             commands::get_token_stats_summary,
             commands::get_token_stats_by_model,
+            commands::get_token_stats_model_account_distribution,
             commands::get_token_stats_model_trend_minute,
             commands::get_token_stats_model_trend_hourly,
             commands::get_token_stats_model_trend_daily,

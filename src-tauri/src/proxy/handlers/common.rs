@@ -185,12 +185,73 @@ pub struct ModelListEntry {
     pub metadata: Option<crate::models::quota::ModelListingMeta>,
 }
 
+/// 判断当前模型 ID 是否为已存在对应裸模型的分档变体后缀
+pub fn is_tiered_variant_of_existing(
+    id: &str,
+    all_ids: &std::collections::HashSet<String>,
+) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "-xhigh",
+        "-high",
+        "-medium",
+        "-low",
+        "-extra-low",
+        "-tiered",
+        "-thinking",
+    ];
+    let lower = id.to_lowercase();
+    for suffix in SUFFIXES {
+        if let Some(base) = lower.strip_suffix(suffix) {
+            if !base.is_empty()
+                && all_ids
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(base))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 整合模型列表条目：过滤掉已存在基底模型的分档变体（例如有 gemini-4-hydrogen 时隐藏 -low/-medium/-high/-xhigh），
+/// 除非该模型在 custom_expose 中被显式配置为 true。
+pub fn consolidate_model_entries(
+    entries: Vec<ModelListEntry>,
+    custom_expose: &std::collections::HashMap<String, bool>,
+) -> Vec<ModelListEntry> {
+    let all_ids: std::collections::HashSet<String> = entries.iter().map(|e| e.id.clone()).collect();
+    entries
+        .into_iter()
+        .filter(|entry| {
+            if custom_expose
+                .get(&entry.id)
+                .copied()
+                .or_else(|| custom_expose.get(&entry.id.to_lowercase()).copied())
+                == Some(true)
+            {
+                return true;
+            }
+            !is_tiered_variant_of_existing(&entry.id, &all_ids)
+        })
+        .collect()
+}
+
 /// 统一收集 `/v1/models`、`/v1/models/claude`、`/v1beta/models` 的共同数据
 ///
 /// 三个协议过去各自重复“取动态模型 + 取元数据 + 回退 token 上限”三遍；
 /// 这里只保留一份数据投影，协议层只负责最终 JSON 形状。
 pub async fn collect_model_list_entries(
     state: &crate::proxy::server::AppState,
+) -> Vec<ModelListEntry> {
+    let consolidate = *state.consolidate_tiered_models.read().await;
+    collect_model_list_entries_filtered(state, consolidate).await
+}
+
+/// 统一收集并支持折叠分档变体的模型列表数据
+pub async fn collect_model_list_entries_filtered(
+    state: &crate::proxy::server::AppState,
+    consolidate: bool,
 ) -> Vec<ModelListEntry> {
     use crate::proxy::common::model_mapping::{
         get_all_dynamic_models, get_all_dynamic_models_metadata,
@@ -206,7 +267,7 @@ pub async fn collect_model_list_entries(
     )
     .await;
 
-    model_ids
+    let entries: Vec<ModelListEntry> = model_ids
         .into_iter()
         .map(|id| {
             let (fallback_ctx, fallback_out) =
@@ -234,7 +295,17 @@ pub async fn collect_model_list_entries(
                 metadata: meta,
             }
         })
-        .collect()
+        .collect();
+
+    if consolidate {
+        let expose_map = crate::modules::config::load_app_config()
+            .ok()
+            .map(|c| c.proxy.custom_mapping_expose)
+            .unwrap_or_default();
+        consolidate_model_entries(entries, &expose_map)
+    } else {
+        entries
+    }
 }
 
 /// OpenAI / Anthropic 兼容的模型对象投影
@@ -1070,7 +1141,14 @@ mod retry_after_tests {
     #[test]
     fn test_build_dual_track_error_internal_limited() {
         let raw_err = "All accounts limited. Wait 30s.";
-        let claude_res = build_dual_track_error("claude", 429, "gemini-2.5-flash", raw_err);
+        let claude_res = build_dual_track_error_with_ua_and_lang(
+            "claude",
+            429,
+            "gemini-2.5-flash",
+            raw_err,
+            None,
+            Some("zh"),
+        );
         assert_eq!(claude_res["error"]["code"], "all_accounts_limited");
         assert!(claude_res["error"]["message"]
             .as_str()
@@ -1082,7 +1160,14 @@ mod retry_after_tests {
     fn test_build_dual_track_error_network_error() {
         let raw_err =
             "HTTP request failed at https://alkalicognition.googleapis.com: failed to connect";
-        let res = build_dual_track_error("claude", 502, "claude-sonnet-4-6", raw_err);
+        let res = build_dual_track_error_with_ua_and_lang(
+            "claude",
+            502,
+            "claude-sonnet-4-6",
+            raw_err,
+            None,
+            Some("zh"),
+        );
         assert_eq!(res["error"]["code"], "upstream_network_error");
         assert_eq!(res["error"]["gateway_error"]["is_server_error"], false);
         assert_eq!(res["error"]["is_server_error"], false);
@@ -1283,5 +1368,41 @@ mod retry_after_tests {
             .as_str()
             .unwrap()
             .contains("【模型全池临时熔断】"));
+    }
+
+    #[test]
+    fn test_consolidate_model_entries() {
+        let make_entry = |id: &str| ModelListEntry {
+            id: id.to_string(),
+            context_limit: 128000,
+            output_limit: 8192,
+            display_name: None,
+            metadata: None,
+        };
+        let entries = vec![
+            make_entry("gemini-4-hydrogen"),
+            make_entry("gemini-4-hydrogen-low"),
+            make_entry("gemini-4-hydrogen-medium"),
+            make_entry("gemini-4-hydrogen-high"),
+            make_entry("gemini-4-hydrogen-xhigh"),
+        ];
+        let mut expose = std::collections::HashMap::new();
+
+        // 默认折叠，只保留基底模型
+        let res = consolidate_model_entries(entries.clone(), &expose);
+        let res_ids: Vec<String> = res.into_iter().map(|e| e.id).collect();
+        assert_eq!(res_ids, vec!["gemini-4-hydrogen".to_string()]);
+
+        // 显式在 custom_expose 中放行 high 变体
+        expose.insert("gemini-4-hydrogen-high".to_string(), true);
+        let res2 = consolidate_model_entries(entries, &expose);
+        let res2_ids: Vec<String> = res2.into_iter().map(|e| e.id).collect();
+        assert_eq!(
+            res2_ids,
+            vec![
+                "gemini-4-hydrogen".to_string(),
+                "gemini-4-hydrogen-high".to_string()
+            ]
+        );
     }
 }

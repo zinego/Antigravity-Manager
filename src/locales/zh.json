@@ -890,6 +890,11 @@
             "delete_rule": "删除规则",
             "move_up": "上移",
             "move_down": "下移"
+        },
+        "model_priority": {
+            "title": "按模型账号优先级",
+            "subtitle": "针对指定模型定义账号调度的绝对优先次序 (1 → 2 → 3...)，耗尽或限流时自动无缝切换与回退",
+            "rules_count": "{{count}} 个模型规则"
         }
     },
     "tray": {
@@ -1583,7 +1588,9 @@
             "select_target_model": "选择目标模型",
             "original_placeholder": "原始名 (如 gemini-3.x-flash，x必须大于8)",
             "wildcard_rule_notice": "通配符规则（x 必须大于 8，如 3.9、3.10 自动转为 3.x-flash-tiered）",
-            "wildcard_only_gemini_3x": "仅允许内置通配符 gemini-3.x-flash（x 必须大于 8），其他请填写具体模型 ID"
+            "wildcard_only_gemini_3x": "仅允许内置通配符 gemini-3.x-flash（x 必须大于 8），其他请填写具体模型 ID",
+            "consolidate_tiered_models": "合并分档模型",
+            "consolidate_tiered_models_tooltip": "开启后在 /v1/models 等接口中将 -low, -medium, -high, -xhigh 等分档变体模型合并为单一基础模型对外暴露"
         },
         "examples": {
             "title": "使用示例"
@@ -2248,7 +2255,16 @@
             "col_metrics": "P95 首字 / 样本数",
             "insufficient_samples": "样本集中在单侧，暂无半窗对比",
             "requests_unit": "请求"
-        }
+        },
+        "flow_card_title": "模型与账号流向",
+        "flow_card_subtitle": "直观透视模型请求在各上游账号间的分配比例与流量聚合",
+        "flow_badge": "流量调度",
+        "flow_all_models": "全部汇总 (All)",
+        "flow_all_pill": "全部汇总 (All)",
+        "flow_others": "其他 (Others)",
+        "loading_flow": "加载模型流向数据中...",
+        "no_flow_data": "暂无模型账号流向数据",
+        "no_flow_data_desc": "在选定时间跨度内尚未捕获到此模型的路由调度调用"
     },
     "errors": {
         "stream": {

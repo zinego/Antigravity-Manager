@@ -588,6 +588,16 @@ pub async fn save_config(
             .axum_server
             .update_only_raw_quota_models(config.proxy.only_raw_quota_models)
             .await;
+        // 更新合并分档模型开关
+        instance
+            .axum_server
+            .update_consolidate_tiered_models(config.proxy.consolidate_tiered_models)
+            .await;
+        // 更新按模型账号优先级
+        instance
+            .token_manager
+            .update_model_account_priority(config.proxy.model_account_priority.clone())
+            .await;
         // 更新上游代理
         instance
             .axum_server
@@ -652,6 +662,15 @@ pub async fn save_config(
         admin
             .axum_server
             .update_only_raw_quota_models(config.proxy.only_raw_quota_models)
+            .await;
+        admin
+            .axum_server
+            .update_consolidate_tiered_models(config.proxy.consolidate_tiered_models)
+            .await;
+        admin
+            .axum_server
+            .token_manager
+            .update_model_account_priority(config.proxy.model_account_priority.clone())
             .await;
         admin
             .axum_server
@@ -1707,6 +1726,14 @@ pub async fn get_token_stats_by_model(
     view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTokenStats>, String> {
     crate::modules::token_stats::get_model_stats(hours, view_mode.as_deref())
+}
+
+#[tauri::command]
+pub async fn get_token_stats_model_account_distribution(
+    hours: i64,
+    view_mode: Option<String>,
+) -> Result<crate::modules::token_stats::ModelAccountDistributionResponse, String> {
+    crate::modules::token_stats::get_model_account_distribution(hours, view_mode.as_deref())
 }
 
 #[tauri::command]

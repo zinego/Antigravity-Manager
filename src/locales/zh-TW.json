@@ -871,6 +871,11 @@
             "delete_rule": "刪除規則",
             "move_up": "上移",
             "move_down": "下移"
+        },
+        "model_priority": {
+            "title": "按模型帳號優先順序",
+            "subtitle": "針對指定模型定義帳號調度的絕對優先次序 (1 → 2 → 3...)，耗盡或限流時自動無縫切換與回退",
+            "rules_count": "{{count}} 個模型規則"
         }
     },
     "tray": {
@@ -1543,7 +1548,9 @@
             "gemini3_group_label": "Gemini 3 (Recommended)",
             "gemini3_option_high": "gemini-3.1-pro-high (High Quality)",
             "gemini3_option_low": "gemini-3.1-pro-low (Balanced)",
-            "gemini3_option_flash": "gemini-3-flash (Fast)"
+            "gemini3_option_flash": "gemini-3-flash (Fast)",
+            "consolidate_tiered_models": "合併分檔模型",
+            "consolidate_tiered_models_tooltip": "開啟後在 /v1/models 等介面中將 -low, -medium, -high, -xhigh 等分檔變體模型合併為單一基礎模型對外暴露"
         },
         "examples": {
             "title": "使用示例"
@@ -2248,7 +2255,16 @@
             "col_metrics": "P95 首字 / 樣本數",
             "insufficient_samples": "樣本集中在單側，暫無半窗對比",
             "requests_unit": "請求"
-        }
+        },
+        "flow_card_title": "模型與帳號流向",
+        "flow_card_subtitle": "直觀透視模型請求在各上游帳號間的分配比例與流量聚合",
+        "flow_badge": "流量調度",
+        "flow_all_models": "全部彙總 (All)",
+        "flow_all_pill": "全部彙總 (All)",
+        "flow_others": "其他 (Others)",
+        "loading_flow": "載入模型流向資料中...",
+        "no_flow_data": "暫無模型帳號流向資料",
+        "no_flow_data_desc": "在選定時間跨度內尚未擷取到此模型的路由調度呼叫"
     },
     "security": {
         "title": "安全監控",

@@ -896,6 +896,11 @@
             "delete_rule": "Delete Rule",
             "move_up": "Move Up",
             "move_down": "Move Down"
+        },
+        "model_priority": {
+            "title": "Model Account Priority",
+            "subtitle": "Define explicit account routing priority per model (1 → 2 → 3...), automatically failing over upon rate limits or quota exhaustion",
+            "rules_count": "{{count}} model rules"
         }
     },
     "tray": {
@@ -1595,7 +1600,9 @@
             "select_target_model": "Select Target Model",
             "original_placeholder": "Original model (e.g. gemini-3.x-flash, x must be > 8)",
             "wildcard_rule_notice": "Wildcard rule (x must be > 8, e.g. 3.9, 3.10 routed to 3.x-flash-tiered)",
-            "wildcard_only_gemini_3x": "Only wildcard gemini-3.x-flash (x > 8) is supported, please specify exact model ID for others"
+            "wildcard_only_gemini_3x": "Only wildcard gemini-3.x-flash (x > 8) is supported, please specify exact model ID for others",
+            "consolidate_tiered_models": "Consolidate Tiered Models",
+            "consolidate_tiered_models_tooltip": "When enabled, /v1/models consolidates tiered variants (-low, -medium, -high, -xhigh) into base canonical models."
         },
         "multi_protocol": {
             "title": "Model Catalog & Protocols",
@@ -2282,7 +2289,16 @@
             "col_metrics": "P95 TTFT / Samples",
             "insufficient_samples": "Samples clustered in one half; insufficient for comparison",
             "requests_unit": "requests"
-        }
+        },
+        "flow_card_title": "Model & Account Flow",
+        "flow_card_subtitle": "Visual breakdown of model request and token distribution across upstream accounts",
+        "flow_badge": "Traffic Flow",
+        "flow_all_models": "All Models Aggregate",
+        "flow_all_pill": "All (Aggregate)",
+        "flow_others": "Others",
+        "loading_flow": "Loading model distribution flow...",
+        "no_flow_data": "No model flow data available",
+        "no_flow_data_desc": "No routed calls captured for this model within the selected time window"
     },
     "errors": {
         "stream": {

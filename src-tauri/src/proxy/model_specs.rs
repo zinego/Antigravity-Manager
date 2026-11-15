@@ -77,7 +77,8 @@ pub fn is_bare_gemini_pro(model: &str) -> bool {
     if !is_gemini_v3_or_above(model) {
         return false;
     }
-    !(lower.ends_with("-high")
+    !(lower.ends_with("-xhigh")
+        || lower.ends_with("-high")
         || lower.ends_with("-medium")
         || lower.ends_with("-low")
         || lower.ends_with("-extra-low")
@@ -93,7 +94,7 @@ pub fn is_bare_gemini_pro(model: &str) -> bool {
         || lower.contains("exp"))
 }
 
-/// 判断模型是否命中显式启发式档位后缀（-high, -medium, -low, -extra-low, -max, -agent, -thinking 等）
+/// 判断模型是否命中显式启发式档位后缀（-xhigh, -high, -medium, -low, -extra-low, -max, -agent, -thinking 等）
 pub fn is_explicit_heuristic_tier_model(model_id: &str) -> bool {
     let lower_raw = model_id.to_lowercase();
     if is_bare_gemini_v3_flash(&lower_raw) || is_bare_gemini_pro(&lower_raw) {
@@ -101,13 +102,15 @@ pub fn is_explicit_heuristic_tier_model(model_id: &str) -> bool {
     }
     let std_id = resolve_alias(model_id);
     let lower = std_id.to_lowercase();
-    lower_raw.ends_with("-high")
+    lower_raw.ends_with("-xhigh")
+        || lower_raw.ends_with("-high")
         || lower_raw.ends_with("-medium")
         || lower_raw.ends_with("-low")
         || lower_raw.ends_with("-extra-low")
         || lower_raw.ends_with("-max")
         || lower_raw.ends_with("-thinking")
         || lower_raw.ends_with("-agent")
+        || lower_raw.contains("-xhigh-")
         || lower_raw.contains("-high-")
         || lower_raw.contains("-medium-")
         || lower_raw.contains("-low-")
@@ -117,13 +120,15 @@ pub fn is_explicit_heuristic_tier_model(model_id: &str) -> bool {
         || lower_raw.contains("-thinking")
         || (!is_bare_gemini_v3_flash(&lower)
             && !is_bare_gemini_pro(&lower)
-            && (lower.ends_with("-high")
+            && (lower.ends_with("-xhigh")
+                || lower.ends_with("-high")
                 || lower.ends_with("-medium")
                 || lower.ends_with("-low")
                 || lower.ends_with("-extra-low")
                 || lower.ends_with("-max")
                 || lower.ends_with("-thinking")
                 || lower.ends_with("-agent")
+                || lower.contains("-xhigh-")
                 || lower.contains("-high-")
                 || lower.contains("-medium-")
                 || lower.contains("-low-")
@@ -206,7 +211,8 @@ pub fn is_bare_gemini_v3_flash(model: &str) -> bool {
         return false;
     }
     // 排除已有任何后缀或变体标记的模型
-    if lower.ends_with("-high")
+    if lower.ends_with("-xhigh")
+        || lower.ends_with("-high")
         || lower.ends_with("-medium")
         || lower.ends_with("-low")
         || lower.ends_with("-extra-low")
@@ -333,7 +339,8 @@ pub fn is_bare_claude_tiered_model(model: &str) -> bool {
     if !is_claude_v5_or_above(model) {
         return false;
     }
-    !(lower.ends_with("-high")
+    !(lower.ends_with("-xhigh")
+        || lower.ends_with("-high")
         || lower.ends_with("-medium")
         || lower.ends_with("-low")
         || lower.ends_with("-extra-low")
@@ -345,39 +352,32 @@ pub fn is_bare_claude_tiered_model(model: &str) -> bool {
 }
 
 /// 档位权重定义：
-/// lite / extra-low (0) < low (1) < default (2) < medium (3) < high (4) < xhigh (5) < max (6)
+/// extra-low (5) < low (10) < medium (20) < tiered (25) < high (30) < xhigh (40)
 pub fn tier_weight(tier: &str) -> i32 {
     let clean = tier.trim().to_lowercase().replace('_', "-");
     match clean.as_str() {
-        "lite" | "flash-lite" | "extra-low" | "minimal" => 0,
-        "low" => 1,
-        "default" => 2,
-        "medium" => 3,
-        "high" => 4,
-        "xhigh" | "x-high" | "extreme" => 5,
-        "max" => 6,
-        _ => 3, // 未知档位默认权重等同 medium
+        "lite" | "flash-lite" | "extra-low" | "minimal" => 5,
+        "low" => 10,
+        "medium" | "normal" | "standard" => 20,
+        "tiered" => 25,
+        "high" => 30,
+        "xhigh" | "x-high" | "extreme" | "max" => 40,
+        _ => 20, // 未知档位默认权重等同 medium
     }
 }
 
 /// 根据默认档位决策原则，从可用档位数组中自适应选取默认档位：
-/// 1. 【铁律】：优先找 high 旗舰算力通道（实测 100% 成功率，6.5s 极速，彻底规避上游容量枯竭）
-/// 2. 其次找 tiered / medium
-/// 3. 极端保底：仅从真实存在的可用档位中取首项，绝不虚构不存在的档位
+/// 1. 优先找 tiered 模型
+/// 2. 其次找 medium
+/// 3. 没有 tiered/medium：优先取严格高于 low 的最低档（Pro 官方只有 low/high → high，与 variant 的 Medium→Pro high 契约一致）
+/// 4. 无 low 档：取 high 下的最高档（保守默认）
+/// 5. 极端保底：仅从真实存在的可用档位中取首项，绝不虚构不存在的档位
 pub fn pick_optimal_default_tier(available_tiers: &[String]) -> Option<String> {
     if available_tiers.is_empty() {
         return None;
     }
 
-    // 1. 优先找 high 旗舰算力通道
-    if let Some(t) = available_tiers
-        .iter()
-        .find(|t| t.eq_ignore_ascii_case("high"))
-    {
-        return Some(t.clone());
-    }
-
-    // 2. 其次找 tiered 模型
+    // 1. 优先找 tiered 模型
     if let Some(t) = available_tiers
         .iter()
         .find(|t| t.eq_ignore_ascii_case("tiered"))
@@ -385,7 +385,7 @@ pub fn pick_optimal_default_tier(available_tiers: &[String]) -> Option<String> {
         return Some(t.clone());
     }
 
-    // 3. 再次找 medium
+    // 2. 其次找 medium
     if let Some(t) = available_tiers
         .iter()
         .find(|t| t.eq_ignore_ascii_case("medium"))
@@ -435,8 +435,9 @@ impl DynamicTierRouter {
     pub fn resolve(model: &str, client_effort: Option<&str>) -> Option<String> {
         let clean = model.trim().to_lowercase();
 
-        // 1. 若当前模型名本身已经带有档位后缀（如 -high, -low, -tiered 等），说明已经是指向具名变体，不在此解析
-        if clean.ends_with("-high")
+        // 1. 若当前模型名本身已经带有档位后缀（如 -xhigh, -high, -low, -tiered 等），说明已经是指向具名变体，不在此解析
+        if clean.ends_with("-xhigh")
+            || clean.ends_with("-high")
             || clean.ends_with("-medium")
             || clean.ends_with("-low")
             || clean.ends_with("-extra-low")
@@ -485,18 +486,30 @@ impl DynamicTierRouter {
         // 3. 客户端显式指定了思考强度：**只接受官方真实存在的档位后缀**；
         // 其余（含 default / 不认识的词 / 该家族不存在的档位）一律走第 4 步的默认档位。
         if let Some(raw) = client_effort.map(|s| s.trim().to_lowercase().replace('_', "-")) {
-            let is_explicit_tier =
-                !raw.is_empty() && !matches!(raw.as_str(), "default" | "none" | "off" | "disabled");
+            let is_explicit_tier = !raw.is_empty()
+                && !matches!(
+                    raw.as_str(),
+                    "default" | "none" | "off" | "disabled" | "false" | "0"
+                );
 
             if is_explicit_tier {
-                // ① 原始值直接命中（如 extra-low / xhigh 若官方真存在）
-                if let Some(matched) = available_tiers
-                    .iter()
-                    .find(|t| t.eq_ignore_ascii_case(&raw))
-                {
-                    return Some(format!("{}-{}", base, matched));
+                // 特殊档位别名规范：x-high / xhigh / max / extreme 优先尝试 xhigh 再 fallback high
+                let candidates: Vec<&str> = match raw.as_str() {
+                    "xhigh" | "x-high" | "max" | "extreme" => vec!["xhigh", "high"],
+                    "extra-low" | "extra_low" => vec!["extra-low", "low"],
+                    _ => vec![raw.as_str()],
+                };
+
+                for cand in candidates {
+                    if let Some(matched) = available_tiers
+                        .iter()
+                        .find(|t| t.eq_ignore_ascii_case(cand))
+                    {
+                        return Some(format!("{}-{}", base, matched));
+                    }
                 }
-                // ② 语义等价映射后再命中（如 xhigh/max → high、minimal → low）
+
+                // 语义等价映射后再命中（如 minimal → low）
                 if let Some(level) = normalize_client_thinking_level(&raw) {
                     let level_lower = level.to_lowercase();
                     if let Some(matched) = available_tiers
@@ -506,7 +519,7 @@ impl DynamicTierRouter {
                         return Some(format!("{}-{}", base, matched));
                     }
                 }
-                // ③ 不属于官方实际后缀档位 → 不猜、不就近，直接走默认档位
+                // 不属于官方实际后缀档位 → 不猜、不就近，直接走默认档位
             }
         }
 
@@ -529,7 +542,7 @@ pub fn available_efforts_for(model_id: &str) -> Vec<String> {
     let base = crate::proxy::common::model_mapping::strip_tier_suffix(model_id);
     let tiers = crate::models::OfficialModelCatalog::collect_tiers_for_base(&base);
     let mut out = Vec::new();
-    for want in ["extra-low", "low", "medium", "high"] {
+    for want in ["extra-low", "low", "medium", "high", "xhigh"] {
         if tiers.iter().any(|t| t.eq_ignore_ascii_case(want)) {
             out.push(want.to_string());
         }
@@ -550,6 +563,17 @@ pub fn resolve_bare_tiered_model_route(model: &str, client_effort: Option<&str>)
 /// 将 3.x Flash 裸模型（如 gemini-3.8-flash, gemini-3.7-flash 等）依据客户端思考档位解析为具名模型（兼容封装）
 pub fn resolve_bare_flash_route(model: &str, client_effort: Option<&str>) -> Option<String> {
     DynamicTierRouter::resolve(model, client_effort)
+}
+
+/// 根据思考预算 Token 数推导路由思考档位
+pub fn effort_from_budget_tokens(budget: u32) -> &'static str {
+    match budget {
+        0 => "none",
+        1..=4096 => "low",
+        4097..=16384 => "medium",
+        16385..=32768 => "high",
+        _ => "xhigh",
+    }
 }
 
 /// 依据系统 Thinking Budget 配置以及当前模型与请求参数，在协议归一化后统一解析应当发送到上游的思考预算。
@@ -595,7 +619,10 @@ pub fn resolve_custom_budget(
 
     let lower = resolve_alias(model).to_lowercase();
     // 档位优先级：模型名后缀（绝对优先）> 客户端 effort > 配置 effort
-    let level = if lower.ends_with("-high") || lower.ends_with("-max") || lower.ends_with("-agent")
+    let level = if lower.ends_with("-xhigh")
+        || lower.ends_with("-high")
+        || lower.ends_with("-max")
+        || lower.ends_with("-agent")
     {
         Some("HIGH")
     } else if lower.ends_with("-low") || lower.ends_with("-extra-low") || lower.ends_with("-lite") {
@@ -773,14 +800,16 @@ mod tests {
         assert_eq!(normalize_client_thinking_level("none"), Some("LOW"));
         assert_eq!(normalize_client_thinking_level("medium"), Some("MEDIUM"));
 
-        // 权重梯队兼容下划线
-        assert_eq!(tier_weight("extra_low"), 0);
-        assert_eq!(tier_weight("extra-low"), 0);
-        assert_eq!(tier_weight("flash_lite"), 0);
-        assert_eq!(tier_weight("low"), 1);
-        assert_eq!(tier_weight("medium"), 3);
-        assert_eq!(tier_weight("x_high"), 5);
-        assert_eq!(tier_weight("high"), 4);
+        // 权重梯队兼容下划线与新权重值
+        assert_eq!(tier_weight("extra_low"), 5);
+        assert_eq!(tier_weight("extra-low"), 5);
+        assert_eq!(tier_weight("flash_lite"), 5);
+        assert_eq!(tier_weight("low"), 10);
+        assert_eq!(tier_weight("medium"), 20);
+        assert_eq!(tier_weight("tiered"), 25);
+        assert_eq!(tier_weight("high"), 30);
+        assert_eq!(tier_weight("x_high"), 40);
+        assert_eq!(tier_weight("xhigh"), 40);
 
         // 裸模型路由支持 extra_low 映射
         assert_eq!(
@@ -839,5 +868,60 @@ mod tests {
             Some((3, 5))
         );
         assert_eq!(parse_claude_version_tuple("gemini-3.8-flash"), None);
+    }
+
+    #[test]
+    fn test_effort_from_budget_tokens() {
+        assert_eq!(effort_from_budget_tokens(0), "none");
+        assert_eq!(effort_from_budget_tokens(1024), "low");
+        assert_eq!(effort_from_budget_tokens(4096), "low");
+        assert_eq!(effort_from_budget_tokens(4097), "medium");
+        assert_eq!(effort_from_budget_tokens(8192), "medium");
+        assert_eq!(effort_from_budget_tokens(16384), "medium");
+        assert_eq!(effort_from_budget_tokens(16385), "high");
+        assert_eq!(effort_from_budget_tokens(24576), "high");
+        assert_eq!(effort_from_budget_tokens(32768), "high");
+        assert_eq!(effort_from_budget_tokens(32769), "xhigh");
+        assert_eq!(effort_from_budget_tokens(65536), "xhigh");
+    }
+
+    #[test]
+    fn test_gemini_4_hydrogen_routing() {
+        assert_eq!(
+            DynamicTierRouter::resolve("gemini-4-hydrogen", Some("low")),
+            Some("gemini-4-hydrogen-low".to_string())
+        );
+        assert_eq!(
+            DynamicTierRouter::resolve("gemini-4-hydrogen", Some("medium")),
+            Some("gemini-4-hydrogen-medium".to_string())
+        );
+        assert_eq!(
+            DynamicTierRouter::resolve("gemini-4-hydrogen", Some("high")),
+            Some("gemini-4-hydrogen-high".to_string())
+        );
+        assert_eq!(
+            DynamicTierRouter::resolve("gemini-4-hydrogen", Some("xhigh")),
+            Some("gemini-4-hydrogen-xhigh".to_string())
+        );
+        assert_eq!(
+            DynamicTierRouter::resolve("gemini-4-hydrogen", Some("x-high")),
+            Some("gemini-4-hydrogen-xhigh".to_string())
+        );
+        assert_eq!(
+            DynamicTierRouter::resolve("gemini-4-hydrogen", Some("max")),
+            Some("gemini-4-hydrogen-xhigh".to_string())
+        );
+        assert_eq!(
+            DynamicTierRouter::resolve("gemini-4-hydrogen", Some("extreme")),
+            Some("gemini-4-hydrogen-xhigh".to_string())
+        );
+        assert_eq!(
+            DynamicTierRouter::resolve("gemini-4-hydrogen", Some("none")),
+            Some("gemini-4-hydrogen-low".to_string())
+        );
+        assert_eq!(
+            DynamicTierRouter::resolve("gemini-4-hydrogen-xhigh", Some("low")),
+            None
+        );
     }
 }

@@ -107,6 +107,7 @@ pub struct AppState {
     pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [FIX Web Mode]
     pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [FIX Web Mode]
     pub only_raw_quota_models: Arc<tokio::sync::RwLock<bool>>, // [NEW] 是否只暴露真实配额模型
+    pub consolidate_tiered_models: Arc<tokio::sync::RwLock<bool>>, // [NEW] 是否在 /v1/models 合并分档模型
     pub image_scheduler: Arc<ImageScheduler>,
 }
 
@@ -443,9 +444,15 @@ pub struct AxumServer {
     pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [NEW] 代理池配置状态
     pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [NEW] 暴露代理池管理器供命令调用
     pub only_raw_quota_models: Arc<tokio::sync::RwLock<bool>>,
+    pub consolidate_tiered_models: Arc<tokio::sync::RwLock<bool>>,
 }
 
 impl AxumServer {
+    pub async fn update_consolidate_tiered_models(&self, consolidate: bool) {
+        let mut r = self.consolidate_tiered_models.write().await;
+        *r = consolidate;
+        tracing::debug!("consolidate_tiered_models 已更新: {}", consolidate);
+    }
     pub async fn update_only_raw_quota_models(&self, only_raw: bool) {
         let mut r = self.only_raw_quota_models.write().await;
         *r = only_raw;
@@ -543,6 +550,7 @@ impl AxumServer {
         cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
         proxy_pool_config: crate::proxy::config::ProxyPoolConfig, // [NEW]
         only_raw_quota_models: bool,
+        consolidate_tiered_models: bool,
         image_scheduler_config: crate::proxy::config::ImageSchedulerConfig,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), String> {
         let custom_mapping_state = Arc::new(tokio::sync::RwLock::new(custom_mapping));
@@ -563,6 +571,8 @@ impl AxumServer {
         let is_running_state = Arc::new(RwLock::new(false));
 
         let only_raw_quota_models_state = Arc::new(tokio::sync::RwLock::new(only_raw_quota_models));
+        let consolidate_tiered_models_state =
+            Arc::new(tokio::sync::RwLock::new(consolidate_tiered_models));
         let image_account_ids = token_manager.enabled_account_ids();
         let image_account_count = image_account_ids.len();
         let image_scheduler = build_image_scheduler(
@@ -611,6 +621,7 @@ impl AxumServer {
             proxy_pool_state: proxy_pool_state.clone(),
             proxy_pool_manager: proxy_pool_manager.clone(),
             only_raw_quota_models: only_raw_quota_models_state.clone(),
+            consolidate_tiered_models: consolidate_tiered_models_state.clone(),
             image_scheduler,
         };
 
@@ -964,6 +975,14 @@ impl AxumServer {
             .route("/stats/token/summary", get(admin_get_token_stats_summary))
             .route("/stats/token/by-model", get(admin_get_token_stats_by_model))
             .route(
+                "/stats/token/model-account-distribution",
+                get(admin_get_token_stats_model_account_distribution),
+            )
+            .route(
+                "/stats/model-account-distribution",
+                get(admin_get_token_stats_model_account_distribution),
+            )
+            .route(
                 "/stats/token/model-speed",
                 get(admin_get_token_stats_model_speed),
             )
@@ -1162,6 +1181,7 @@ impl AxumServer {
             proxy_pool_state,
             proxy_pool_manager,
             only_raw_quota_models: only_raw_quota_models_state,
+            consolidate_tiered_models: consolidate_tiered_models_state,
         };
 
         let server_cancel_token = cancel_token.clone();
@@ -2087,6 +2107,18 @@ async fn admin_save_config(
         let mut only_raw = state.only_raw_quota_models.write().await;
         *only_raw = new_config.proxy.only_raw_quota_models;
     }
+
+    // 更新“合并分档模型”状态
+    {
+        let mut consolidate = state.consolidate_tiered_models.write().await;
+        *consolidate = new_config.proxy.consolidate_tiered_models;
+    }
+
+    // 更新模型账号优先级队列
+    state
+        .token_manager
+        .update_model_account_priority(new_config.proxy.model_account_priority.clone())
+        .await;
 
     // 更新上游代理
     {
@@ -3047,6 +3079,31 @@ async fn admin_get_token_stats_by_model(
 
     match res {
         Ok(Ok(stats)) => Ok(Json(stats)),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+async fn admin_get_token_stats_model_account_distribution(
+    Query(p): Query<StatsPeriodQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let hours = p.hours.unwrap_or(168);
+    let view_mode = p.view_mode;
+    let res = tokio::task::spawn_blocking(move || {
+        token_stats::get_model_account_distribution(hours, view_mode.as_deref())
+    })
+    .await;
+
+    match res {
+        Ok(Ok(dist)) => Ok(Json(dist)),
         Ok(Err(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),

@@ -185,9 +185,22 @@ pub async fn handle_generate(
         .unwrap_or(&body)
         .get("generationConfig")
         .and_then(|gc| gc.get("thinkingConfig"));
-    let client_effort = thinking_cfg
+    let mut client_effort = thinking_cfg
         .and_then(|tc| tc.get("thinkingLevel").or_else(|| tc.get("effort")))
         .and_then(|v| v.as_str());
+    let derived_effort_from_budget;
+    if client_effort.is_none() {
+        if let Some(b) = thinking_cfg
+            .and_then(|tc| tc.get("thinkingBudget"))
+            .and_then(|v| v.as_i64())
+        {
+            if b >= 0 {
+                derived_effort_from_budget =
+                    crate::proxy::model_specs::effort_from_budget_tokens(b as u32);
+                client_effort = Some(derived_effort_from_budget);
+            }
+        }
+    }
     // Gemini 的“关闭思考”表达在 thinkingConfig 内部（includeThoughts=false / budget=0）
     let explicit_disable = thinking_cfg.map_or(false, |tc| {
         tc.get("includeThoughts").and_then(|v| v.as_bool()) == Some(false)
@@ -1431,9 +1444,22 @@ pub async fn execute_count_tokens(
         .unwrap_or(&body)
         .get("generationConfig")
         .and_then(|gc| gc.get("thinkingConfig"));
-    let client_effort = thinking_cfg
+    let mut client_effort = thinking_cfg
         .and_then(|tc| tc.get("thinkingLevel").or_else(|| tc.get("effort")))
         .and_then(|v| v.as_str());
+    let derived_effort_from_budget;
+    if client_effort.is_none() {
+        if let Some(b) = thinking_cfg
+            .and_then(|tc| tc.get("thinkingBudget"))
+            .and_then(|v| v.as_i64())
+        {
+            if b >= 0 {
+                derived_effort_from_budget =
+                    crate::proxy::model_specs::effort_from_budget_tokens(b as u32);
+                client_effort = Some(derived_effort_from_budget);
+            }
+        }
+    }
     let explicit_disable = thinking_cfg.map_or(false, |tc| {
         tc.get("includeThoughts").and_then(|v| v.as_bool()) == Some(false)
             || tc.get("thinkingBudget").and_then(|v| v.as_i64()) == Some(0)

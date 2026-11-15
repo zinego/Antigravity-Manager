@@ -110,6 +110,7 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'get_token_stats_by_account': { url: '/api/stats/token/by-account', method: 'GET' },
   'get_token_stats_summary': { url: '/api/stats/token/summary', method: 'GET' },
   'get_token_stats_by_model': { url: '/api/stats/token/by-model', method: 'GET' },
+  'get_token_stats_model_account_distribution': { url: '/api/stats/token/model-account-distribution', method: 'GET' },
   'get_token_stats_model_speed': { url: '/api/stats/token/model-speed', method: 'GET' },
   'get_token_stats_model_trend_hourly': { url: '/api/stats/token/model-trend/hourly', method: 'GET' },
   'get_token_stats_model_trend_daily': { url: '/api/stats/token/model-trend/daily', method: 'GET' },
