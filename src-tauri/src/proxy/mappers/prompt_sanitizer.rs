@@ -990,7 +990,94 @@ impl PromptSanitizer {
             }
         }
 
+        // 4. 执行零宽字符敏感词脱敏（若启用）
+        Self::apply_sensitive_word_obfuscation(body);
+
         cleaned_count
+    }
+
+    /// 敏感词零宽字符脱敏处理（全局配置入口）：
+    /// 自动读取静态单例配置与预编译 Matcher。
+    fn apply_sensitive_word_obfuscation(body: &mut Value) {
+        let Some(matcher) = crate::proxy::config::get_sensitive_word_matcher() else {
+            return;
+        };
+        let cfg = crate::proxy::config::get_sensitive_word_obfuscation_config();
+        if !cfg.enabled {
+            return;
+        }
+        Self::apply_sensitive_word_obfuscation_with_matcher(body, cfg.scope, &matcher);
+    }
+
+    /// 敏感词零宽字符脱敏处理（显式配置与 Matcher 入口）：
+    /// 供单元测试或内部自定义流水线直接调用，完全免除静态全局状态污染与并发竞争。
+    /// 严格捍卫：
+    /// 1. 思考块受 thoughtSignature 保护，绝对不可变；
+    /// 2. tools、functionCall、functionResponse、inlineData 绝不触碰；
+    /// 3. system_instruction 模式：仅脱敏 systemInstruction / system_instruction 中的文本；
+    /// 4. system_and_messages 模式：同时脱敏 contents 中的文本，并在 contents 提问中保护围栏代码块。
+    pub fn apply_sensitive_word_obfuscation_with_matcher(
+        body: &mut Value,
+        scope: crate::proxy::config::SensitiveWordObfuscationScope,
+        matcher: &crate::proxy::mappers::cloak_obfuscate::SensitiveWordMatcher,
+    ) {
+        // 1. 脱敏 systemInstruction 或 system_instruction
+        for sys_key in ["systemInstruction", "system_instruction"] {
+            if let Some(sys) = body.get_mut(sys_key) {
+                if let Some(parts) = sys.get_mut("parts").and_then(Value::as_array_mut) {
+                    for part in parts.iter_mut() {
+                        if let Some(obj) = part.as_object_mut() {
+                            let is_thought =
+                                obj.get("thought").and_then(Value::as_bool).unwrap_or(false)
+                                    || obj.contains_key("thoughtSignature")
+                                    || obj.contains_key("thought_signature");
+                            if is_thought {
+                                continue;
+                            }
+                            if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                                let (obfuscated, count) = matcher.obfuscate_text(text);
+                                if count > 0 {
+                                    obj.insert("text".to_string(), Value::String(obfuscated));
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(sys_str) = sys.as_str() {
+                    let (obfuscated, count) = matcher.obfuscate_text(sys_str);
+                    if count > 0 {
+                        *sys = Value::String(obfuscated);
+                    }
+                }
+            }
+        }
+
+        // 2. 若作用域包含 messages，脱敏 contents 中的文本部分（保护围栏代码块）
+        if scope == crate::proxy::config::SensitiveWordObfuscationScope::SystemAndMessages {
+            if let Some(contents) = body.get_mut("contents").and_then(Value::as_array_mut) {
+                for turn in contents.iter_mut() {
+                    if let Some(parts) = turn.get_mut("parts").and_then(Value::as_array_mut) {
+                        for part in parts.iter_mut() {
+                            if let Some(obj) = part.as_object_mut() {
+                                let is_thought =
+                                    obj.get("thought").and_then(Value::as_bool).unwrap_or(false)
+                                        || obj.contains_key("thoughtSignature")
+                                        || obj.contains_key("thought_signature");
+                                if is_thought {
+                                    continue;
+                                }
+                                if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                                    let (obfuscated, count) =
+                                        matcher.obfuscate_text_protecting_fenced_code(text);
+                                    if count > 0 {
+                                        obj.insert("text".to_string(), Value::String(obfuscated));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2347,5 +2434,169 @@ mod tests {
         assert!(!text.contains("C2 frameworks"));
         assert!(text.contains("# Harness"));
         assert!(text.contains("Please fix the gateway bug."));
+    }
+
+    #[test]
+    fn test_sensitive_word_obfuscation_system_instruction_scope() {
+        use crate::proxy::mappers::cloak_obfuscate::SensitiveWordMatcher;
+
+        let matcher =
+            SensitiveWordMatcher::from_words(&["proxy".to_string(), "Claude Code".to_string()])
+                .expect("matcher should build");
+
+        let mut payload = json!({
+            "systemInstruction": {
+                "parts": [
+                    { "text": "You are a proxy helper for Claude Code." }
+                ]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "text": "Please configure my proxy setting." }
+                    ]
+                }
+            ],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "proxy_tool",
+                            "description": "Tool for proxy management."
+                        }
+                    ]
+                }
+            ]
+        });
+
+        PromptSanitizer::apply_sensitive_word_obfuscation_with_matcher(
+            &mut payload,
+            crate::proxy::config::SensitiveWordObfuscationScope::SystemInstruction,
+            &matcher,
+        );
+
+        let sys_text = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            sys_text.contains("p\u{200B}roxy"),
+            "systemInstruction must have obfuscated sensitive words"
+        );
+        assert!(
+            sys_text.contains("C\u{200B}laude Code"),
+            "longer phrase must be obfuscated as whole"
+        );
+
+        // contents in SystemInstruction scope must NOT be obfuscated
+        let user_text = payload["contents"][0]["parts"][0]["text"].as_str().unwrap();
+        assert_eq!(user_text, "Please configure my proxy setting.");
+    }
+
+    #[test]
+    fn test_sensitive_word_obfuscation_system_and_messages_scope_protects_code_and_thoughts() {
+        use crate::proxy::mappers::cloak_obfuscate::SensitiveWordMatcher;
+
+        let matcher =
+            SensitiveWordMatcher::from_words(&["proxy".to_string()]).expect("matcher should build");
+
+        let mut payload = json!({
+            "systemInstruction": {
+                "parts": [
+                    { "text": "System proxy rule." }
+                ]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": "User proxy query with code:\n```python\nproxy = \"http://127.0.0.1\"\nprint(proxy)\n```\nAnother proxy note."
+                        }
+                    ]
+                },
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "thought": true,
+                            "thoughtSignature": "sig_proxy_123",
+                            "text": "Thinking about proxy setting."
+                        },
+                        {
+                            "text": "Model proxy reply."
+                        }
+                    ]
+                }
+            ]
+        });
+
+        PromptSanitizer::apply_sensitive_word_obfuscation_with_matcher(
+            &mut payload,
+            crate::proxy::config::SensitiveWordObfuscationScope::SystemAndMessages,
+            &matcher,
+        );
+
+        let sys_text = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(sys_text.contains("p\u{200B}roxy"));
+
+        let user_text = payload["contents"][0]["parts"][0]["text"].as_str().unwrap();
+        assert!(user_text.contains("User p\u{200B}roxy query"));
+        assert!(user_text.contains("Another p\u{200B}roxy note."));
+        // Fenced code block must be protected!
+        assert!(user_text.contains(r#"proxy = "http://127.0.0.1""#));
+        assert!(user_text.contains("print(proxy)"));
+
+        // Thought block must remain byte-for-byte untouched!
+        let thought_text = payload["contents"][1]["parts"][0]["text"].as_str().unwrap();
+        assert_eq!(thought_text, "Thinking about proxy setting.");
+
+        // Non-thought model part in contents is obfuscated
+        let model_text = payload["contents"][1]["parts"][1]["text"].as_str().unwrap();
+        assert!(model_text.contains("Model p\u{200B}roxy reply."));
+    }
+
+    #[test]
+    fn test_sanitize_gemini_payload_with_global_obfuscation_config() {
+        let _lock = crate::proxy::config::TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                crate::proxy::config::update_sensitive_word_obfuscation_config(
+                    crate::proxy::config::SensitiveWordObfuscationConfig::default(),
+                );
+            }
+        }
+        let _guard = ResetGuard;
+
+        // Use a unique synthetic keyword so parallel tests never collide
+        let unique_kw = "__OBFUSCATE_GLOBAL_E2E_WORD__";
+        crate::proxy::config::update_sensitive_word_obfuscation_config(
+            crate::proxy::config::SensitiveWordObfuscationConfig {
+                enabled: true,
+                scope: crate::proxy::config::SensitiveWordObfuscationScope::SystemInstruction,
+                sensitive_words: vec![unique_kw.to_string()],
+            },
+        );
+
+        let mut payload = json!({
+            "systemInstruction": {
+                "parts": [
+                    { "text": format!("Instruction with {}", unique_kw) }
+                ]
+            }
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+
+        let sys_text = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(sys_text.contains("_\u{200B}_OBFUSCATE_GLOBAL_E2E_WORD__"));
     }
 }

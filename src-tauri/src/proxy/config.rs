@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 // use std::path::PathBuf;
+use crate::proxy::mappers::cloak_obfuscate::SensitiveWordMatcher;
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 // ============================================================================
 // 辅助工具函数
@@ -127,6 +128,60 @@ pub fn update_global_system_prompt_config(config: GlobalSystemPromptConfig) {
 }
 
 // ============================================================================
+// ============================================================================
+// 零宽字符敏感词脱敏配置存储
+// ============================================================================
+static GLOBAL_SENSITIVE_WORD_OBFUSCATION_CONFIG: OnceLock<
+    RwLock<(
+        SensitiveWordObfuscationConfig,
+        Option<Arc<SensitiveWordMatcher>>,
+    )>,
+> = OnceLock::new();
+
+pub fn get_sensitive_word_obfuscation_config() -> SensitiveWordObfuscationConfig {
+    GLOBAL_SENSITIVE_WORD_OBFUSCATION_CONFIG
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|guard| guard.0.clone())
+        .unwrap_or_default()
+}
+
+pub fn get_sensitive_word_matcher() -> Option<Arc<SensitiveWordMatcher>> {
+    GLOBAL_SENSITIVE_WORD_OBFUSCATION_CONFIG
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .and_then(|guard| guard.1.clone())
+}
+
+pub fn update_sensitive_word_obfuscation_config(config: SensitiveWordObfuscationConfig) {
+    let matcher = if config.enabled && !config.sensitive_words.is_empty() {
+        SensitiveWordMatcher::from_words(&config.sensitive_words).map(Arc::new)
+    } else {
+        None
+    };
+
+    if let Some(lock) = GLOBAL_SENSITIVE_WORD_OBFUSCATION_CONFIG.get() {
+        if let Ok(mut state) = lock.write() {
+            *state = (config.clone(), matcher);
+            tracing::info!(
+                "[Sensitive-Word-Obfuscation] Config updated: enabled={}, scope={:?}, words_count={}",
+                config.enabled,
+                config.scope,
+                config.sensitive_words.len()
+            );
+        }
+    } else {
+        let _ =
+            GLOBAL_SENSITIVE_WORD_OBFUSCATION_CONFIG.set(RwLock::new((config.clone(), matcher)));
+        tracing::info!(
+            "[Sensitive-Word-Obfuscation] Config initialized: enabled={}, scope={:?}, words_count={}",
+            config.enabled,
+            config.scope,
+            config.sensitive_words.len()
+        );
+    }
+}
+
 // 全局图像思维模式配置存储
 // ============================================================================
 static GLOBAL_IMAGE_THINKING_MODE: OnceLock<RwLock<String>> = OnceLock::new();
@@ -464,6 +519,36 @@ pub struct GlobalSystemPromptConfig {
     /// 系统提示词内容
     #[serde(default)]
     pub content: String,
+}
+
+/// 敏感词脱敏生效范围
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SensitiveWordObfuscationScope {
+    #[default]
+    SystemInstruction,
+    SystemAndMessages,
+}
+
+/// 零宽字符敏感词脱敏配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SensitiveWordObfuscationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub scope: SensitiveWordObfuscationScope,
+    #[serde(default)]
+    pub sensitive_words: Vec<String>,
+}
+
+impl Default for SensitiveWordObfuscationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scope: SensitiveWordObfuscationScope::default(),
+            sensitive_words: Vec::new(),
+        }
+    }
 }
 
 impl Default for GlobalSystemPromptConfig {
@@ -1202,6 +1287,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub global_system_prompt: GlobalSystemPromptConfig,
 
+    /// 零宽字符敏感词脱敏配置
+    #[serde(default)]
+    pub sensitive_word_obfuscation: SensitiveWordObfuscationConfig,
+
     /// 图像思维模式配置
     /// - enabled: 保留思维链 (默认)
     /// - disabled: 移除思维链 (画质优先)
@@ -1395,6 +1484,7 @@ impl Default for ProxyConfig {
             saved_user_agent: None,
             thinking_budget: ThinkingBudgetConfig::default(),
             global_system_prompt: GlobalSystemPromptConfig::default(),
+            sensitive_word_obfuscation: SensitiveWordObfuscationConfig::default(),
             proxy_pool: ProxyPoolConfig::default(),
             multimodal: MultimodalConfig::default(),
             stream_timeouts: StreamTimeoutConfig::default(),
@@ -1532,5 +1622,82 @@ mod tests {
         // 测试边缘情况
         assert_eq!(normalize_proxy_url(""), "");
         assert_eq!(normalize_proxy_url("   "), "");
+    }
+}
+
+#[cfg(test)]
+mod sensitive_word_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_sensitive_word_obfuscation_config_defaults_and_backward_compat() {
+        // Deserializing ProxyConfig when sensitive_word_obfuscation field is missing
+        let json_data = r#"{
+            "enabled": true,
+            "port": 8045,
+            "api_key": "test_key",
+            "auto_start": false,
+            "request_timeout": 120,
+            "enable_logging": true,
+            "upstream_proxy": { "enabled": false, "url": "" }
+        }"#;
+
+        let cfg: ProxyConfig =
+            serde_json::from_str(json_data).expect("should deserialize without field");
+        assert_eq!(cfg.sensitive_word_obfuscation.enabled, false);
+        assert_eq!(
+            cfg.sensitive_word_obfuscation.scope,
+            SensitiveWordObfuscationScope::SystemInstruction
+        );
+        assert!(cfg.sensitive_word_obfuscation.sensitive_words.is_empty());
+
+        // Serializing with sensitive_word_obfuscation
+        let mut custom = cfg.clone();
+        custom.sensitive_word_obfuscation = SensitiveWordObfuscationConfig {
+            enabled: true,
+            scope: SensitiveWordObfuscationScope::SystemAndMessages,
+            sensitive_words: vec!["proxy".to_string(), "claude".to_string()],
+        };
+
+        let serialized = serde_json::to_string(&custom).expect("should serialize");
+        let deserialized: ProxyConfig =
+            serde_json::from_str(&serialized).expect("should roundtrip");
+        assert_eq!(
+            deserialized.sensitive_word_obfuscation,
+            custom.sensitive_word_obfuscation
+        );
+    }
+
+    #[test]
+    fn test_update_sensitive_word_obfuscation_config_updates_matcher() {
+        let _lock = TEST_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                update_sensitive_word_obfuscation_config(SensitiveWordObfuscationConfig::default());
+            }
+        }
+        let _guard = ResetGuard;
+
+        update_sensitive_word_obfuscation_config(SensitiveWordObfuscationConfig {
+            enabled: true,
+            scope: SensitiveWordObfuscationScope::SystemInstruction,
+            sensitive_words: vec!["custom_keyword".to_string()],
+        });
+
+        let matcher = get_sensitive_word_matcher()
+            .expect("matcher should be present when enabled with words");
+        let (out, count) = matcher.obfuscate_text("Calling custom_keyword now");
+        assert_eq!(count, 1);
+        assert!(out.contains("c\u{200B}ustom_keyword"));
+
+        // Disable and verify matcher is cleared
+        update_sensitive_word_obfuscation_config(SensitiveWordObfuscationConfig {
+            enabled: false,
+            scope: SensitiveWordObfuscationScope::SystemInstruction,
+            sensitive_words: vec!["custom_keyword".to_string()],
+        });
+        assert!(get_sensitive_word_matcher().is_none());
     }
 }

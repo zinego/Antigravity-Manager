@@ -852,7 +852,21 @@
             "char_count": "{{count}} 字符",
             "long_prompt_warning": "提示词较长（超过 2000 字符），可能会占用较多的上下文窗口空间。"
         },
-        "lightweight_mode_desc": "开启后退出或最小化到托盘将彻底释放 WebView 内存"
+        "lightweight_mode_desc": "开启后退出或最小化到托盘将彻底释放 WebView 内存",
+        "sensitive_word_obfuscation": {
+            "title": "零宽字符敏感词脱敏 (Zero-Width Cloak)",
+            "hint": "在匹配的敏感词第 1 个字符后插入不可见零宽空格 (U+200B)，规避关键词风控与审查误杀",
+            "scope_label": "生效作用域 (Scope)",
+            "scope_system_desc": "仅脱敏系统提示词 (systemInstruction)，对话消息与代码完全不受影响",
+            "scope_messages_desc": "脱敏系统提示词与对话上下文（自动保护围栏代码块中的代码不变）",
+            "scope_system_only": "仅系统提示词 (推荐)",
+            "scope_system_and_messages": "系统提示词 + 消息正文",
+            "words_label": "敏感词列表（每行一个，不区分大小写）",
+            "load_presets": "导入常用词 (CPA 预设)",
+            "placeholder": "输入需脱敏的词汇或短语，每行一个...\n例如：\nproxy\nClaude Code\nAnthropic\nOpenAI",
+            "word_count": "已生效 {{count}} 个敏感词（≥2 字符）",
+            "safe_notice": "思考块（thought）与签名严格保持原样"
+        }
     },
     "tray": {
         "current": "当前",

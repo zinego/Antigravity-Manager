@@ -37,17 +37,21 @@ pub mod upstream; // 上游客户端
 pub mod video; // 视频处理模块
 
 pub use cache_profile::{cache_profile, CacheProfile};
+pub use config::get_sensitive_word_obfuscation_config;
 pub use config::get_stream_timeout_config;
 pub use config::get_upload_timeout_config;
 pub use config::update_global_system_prompt_config;
 pub use config::update_image_thinking_mode;
 pub use config::update_multimodal_config;
+pub use config::update_sensitive_word_obfuscation_config;
 pub use config::update_stream_timeout_config;
 pub use config::update_thinking_budget_config;
 pub use config::update_upload_timeout_config;
 pub use config::ProxyAuthMode;
 pub use config::ProxyConfig;
 pub use config::ProxyPoolConfig;
+pub use config::SensitiveWordObfuscationConfig;
+pub use config::SensitiveWordObfuscationScope;
 pub use config::StreamTimeoutConfig;
 pub use config::UploadTimeoutConfig;
 #[allow(unused_imports)]

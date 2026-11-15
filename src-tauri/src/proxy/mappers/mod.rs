@@ -3,6 +3,7 @@
 
 pub mod caveman_cleaner;
 pub mod claude;
+pub mod cloak_obfuscate;
 pub mod common_utils;
 pub mod context_manager;
 pub mod error_classifier;

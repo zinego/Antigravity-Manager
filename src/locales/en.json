@@ -858,7 +858,21 @@
             "title": "Antigravity Tools",
             "subtitle": "Professional Account Management"
         },
-        "lightweight_mode_desc": "Fully releases WebView memory when exiting or minimizing to tray"
+        "lightweight_mode_desc": "Fully releases WebView memory when exiting or minimizing to tray",
+        "sensitive_word_obfuscation": {
+            "title": "Zero-Width Sensitive Word Cloak",
+            "hint": "Inserts an invisible zero-width space (U+200B) after the first character of sensitive words to avoid keyword-based filters",
+            "scope_label": "Obfuscation Scope",
+            "scope_system_desc": "Applies to systemInstruction only; messages and code snippets remain untouched",
+            "scope_messages_desc": "Applies to systemInstruction and message turns (fenced code blocks are preserved)",
+            "scope_system_only": "System Prompt Only (Recommended)",
+            "scope_system_and_messages": "System Prompt + Messages",
+            "words_label": "Sensitive Words List (one per line, case-insensitive)",
+            "load_presets": "Load Presets (CPA Defaults)",
+            "placeholder": "Enter sensitive words or phrases, one per line...\nExample:\nproxy\nClaude Code\nAnthropic\nOpenAI",
+            "word_count": "{{count}} active sensitive words (>=2 chars)",
+            "safe_notice": "Thoughts and signatures are strictly preserved"
+        }
     },
     "tray": {
         "current": "Current",

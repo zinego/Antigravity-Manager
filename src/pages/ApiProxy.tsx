@@ -43,6 +43,7 @@ import { listAccounts } from '../services/accountService';
 import { motion } from 'framer-motion';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
 import GlobalSystemPrompt from '../components/settings/GlobalSystemPrompt';
+import SensitiveWordObfuscation from '../components/settings/SensitiveWordObfuscation';
 import ImageThinkingMode from '../components/settings/ImageThinkingMode';
 import ThinkingBudget from '../components/settings/ThinkingBudget';
 import MultimodalSettings from '../components/settings/MultimodalSettings';
@@ -3051,6 +3052,13 @@ print(response.choices[0].message.content)`;
                                         <GlobalSystemPrompt
                                             config={appConfig.proxy.global_system_prompt || { enabled: false, content: '' }}
                                             onChange={(newConfig) => updateProxyConfig({ global_system_prompt: newConfig })}
+                                        />
+                                    </div>
+                                    {/* 零宽字符敏感词脱敏 */}
+                                    <div className="pt-4 border-t border-gray-100 dark:border-base-300">
+                                        <SensitiveWordObfuscation
+                                            config={appConfig.proxy.sensitive_word_obfuscation || { enabled: false, scope: 'system_instruction', sensitive_words: [] }}
+                                            onChange={(newConfig) => updateProxyConfig({ sensitive_word_obfuscation: newConfig })}
                                         />
                                     </div>
                                 </div>

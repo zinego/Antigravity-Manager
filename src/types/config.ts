@@ -29,6 +29,7 @@ export interface ProxyConfig {
     hub_cl?: string;
     thinking_budget?: ThinkingBudgetConfig;
     global_system_prompt?: GlobalSystemPromptConfig;
+    sensitive_word_obfuscation?: SensitiveWordObfuscationConfig;
     image_thinking_mode?: 'enabled' | 'disabled'; // [NEW] 图像思维模式开关
     only_raw_quota_models?: boolean; // [NEW] 是否只暴露真实配额模型
     proxy_pool?: ProxyPoolConfig;
@@ -140,6 +141,14 @@ export interface GlobalSystemPromptConfig {
     enabled: boolean;
     /** 提示词内容 */
     content: string;
+}
+
+export type SensitiveWordObfuscationScope = "system_instruction" | "system_and_messages";
+
+export interface SensitiveWordObfuscationConfig {
+    enabled: boolean;
+    scope: SensitiveWordObfuscationScope;
+    sensitive_words: string[];
 }
 
 export interface DebugLoggingConfig {
