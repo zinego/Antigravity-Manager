@@ -39,6 +39,7 @@ import type { ModelShareItem } from '../components/token_stats/TopModelsShareCar
 import { AppleBentoView } from '../components/token_stats/AppleBentoView';
 import { CyberCockpitView } from '../components/token_stats/CyberCockpitView';
 import { PricingModal } from '../components/token_stats/PricingModal';
+import { ModelSpeedCard } from '../components/token_stats/ModelSpeedCard';
 
 export interface TokenStatsAggregated {
     period: string;
@@ -70,6 +71,50 @@ export interface ModelTokenStats {
     total_tokens: number;
     request_count: number;
     avg_ttft_ms?: number;
+    avg_output_tps?: number;
+}
+
+export interface ModelSpeedBucketPoint {
+    avg_tps: number;
+    sample_count: number;
+    total_output_tokens: number;
+}
+
+export interface ModelSpeedBucket {
+    label: string;
+    start_ts: number;
+    end_ts: number;
+    models: Record<string, ModelSpeedBucketPoint>;
+}
+
+export interface ModelSpeedItem {
+    model: string;
+    sample_count: number;
+    total_output_tokens: number;
+    avg_tps: number;
+    weighted_tps: number;
+    min_tps: number;
+    max_tps: number;
+    avg_ttft_ms?: number;
+    p95_ttft_ms?: number;
+    first_half_tps?: number;
+    second_half_tps?: number;
+    tps_delta?: number;
+}
+
+export interface ModelSpeedGlobalSummary {
+    total_samples: number;
+    total_output_tokens: number;
+    avg_tps?: number;
+    weighted_tps?: number;
+    avg_ttft_ms?: number;
+    p95_ttft_ms?: number;
+}
+
+export interface ModelSpeedResponse {
+    summary: ModelSpeedGlobalSummary;
+    models: ModelSpeedItem[];
+    buckets: ModelSpeedBucket[];
 }
 
 export interface ModelTrendPoint {
@@ -91,6 +136,7 @@ export interface TokenStatsSummary {
     total_requests: number;
     unique_accounts: number;
     avg_ttft_ms?: number;
+    avg_output_tps?: number;
 }
 
 export interface ModelPricingRule {
@@ -335,6 +381,7 @@ const TokenStats: React.FC = () => {
     const [allModels, setAllModels] = useState<string[]>([]);
     const [allAccounts, setAllAccounts] = useState<string[]>([]);
     const [summary, setSummary] = useState<TokenStatsSummary | null>(null);
+    const [speedData, setSpeedData] = useState<ModelSpeedResponse | null>(null);
     const [loading, setLoading] = useState(true);
 
     // 经典模式专属堆叠图数据
@@ -404,6 +451,7 @@ const TokenStats: React.FC = () => {
             total_cached_tokens: m.total_cached_tokens,
             cost: calculateModelCost(m),
             avg_ttft_ms: m.avg_ttft_ms,
+            avg_output_tps: m.avg_output_tps,
         }));
     }, [modelData, calculateModelCost]);
 
@@ -551,19 +599,21 @@ const TokenStats: React.FC = () => {
             });
             setAccountTrendData(transformedAccountTrend);
 
-            // 并行拉取账户统计、模型统计、全局概览、经典看板堆叠数据，以及洞察看板的 91 天热力图与 24 小时柱状图
-            const [accounts, models_stats, summaryData, classicData, raw91Days, raw24Hours] = await Promise.all([
+            // 并行拉取账户统计、模型统计、全局概览、测速数据、经典看板堆叠数据，以及洞察看板的 91 天热力图与 24 小时柱状图
+            const [accounts, models_stats, summaryData, classicData, raw91Days, raw24Hours, speedDataRes] = await Promise.all([
                 invoke<AccountTokenStats[]>('get_token_stats_by_account', { hours }),
                 invoke<ModelTokenStats[]>('get_token_stats_by_model', { hours, viewMode: modelPerspective }),
                 invoke<TokenStatsSummary>('get_token_stats_summary', { hours }),
                 classicDataPromise,
                 invoke<TokenStatsAggregated[]>('get_token_stats_daily', { days: 91 }),
                 invoke<TokenStatsAggregated[]>('get_token_stats_hourly', { hours: 24 }),
+                invoke<ModelSpeedResponse>('get_token_stats_model_speed', { hours, buckets: 8, viewMode: modelPerspective }),
             ]);
 
             setAccountData(accounts);
             setModelData(models_stats);
             setSummary(summaryData);
+            setSpeedData(speedDataRes);
 
             // 转换经典看板堆叠柱状图数据
             setClassicChartData(
@@ -994,7 +1044,7 @@ const TokenStats: React.FC = () => {
 
                 {/* ==================== 0. 赛博大盘模式 (Cyber Cockpit View) ==================== */}
                 {dashboardMode === 'cockpit' && (
-                    <div className="flex-1 min-h-0 overflow-hidden">
+                    <div className="flex-1 min-h-0 overflow-hidden space-y-4">
                         <CyberCockpitView
                             summary={summary}
                             hourlyData={hourlyTrendData}
@@ -1008,36 +1058,40 @@ const TokenStats: React.FC = () => {
                             formatCurrency={formatCurrency}
                             setShowPricingModal={setShowPricingModal}
                         />
+                        <ModelSpeedCard speedData={speedData} loading={loading} />
                     </div>
                 )}
 
                 {/* ==================== 1. 深度洞察看板 (Apple Bento View) ==================== */}
                 {dashboardMode === 'insights' && (
-                    <AppleBentoView
-                        summary={summary}
-                        dailyData={heatmapData}
-                        hourlyData={hourlyTrendData}
-                        timelineData={classicChartData}
-                        modelShareItems={modelShareItems}
-                        accountData={accountData}
-                        displayModelTrendData={displayModelTrendData}
-                        displayAccountTrendData={displayAccountTrendData}
-                        allModels={allModels}
-                        allAccounts={allAccounts}
-                        viewMode={viewMode}
-                        metricType={metricType}
-                        chartType={chartType}
-                        timeRange={timeRange}
-                        totalEstimatedCost={totalEstimatedCost}
-                        cacheMetrics={cacheMetrics}
-                        formatNumber={formatNumber}
-                        formatCurrency={formatCurrency}
-                        switchChartType={switchChartType}
-                        switchMetricType={switchMetricType}
-                        switchViewMode={switchViewMode}
-                        setShowPricingModal={setShowPricingModal}
-                        customTooltip={CustomTrendTooltip}
-                    />
+                    <div className="space-y-4">
+                        <AppleBentoView
+                            summary={summary}
+                            dailyData={heatmapData}
+                            hourlyData={hourlyTrendData}
+                            timelineData={classicChartData}
+                            modelShareItems={modelShareItems}
+                            accountData={accountData}
+                            displayModelTrendData={displayModelTrendData}
+                            displayAccountTrendData={displayAccountTrendData}
+                            allModels={allModels}
+                            allAccounts={allAccounts}
+                            viewMode={viewMode}
+                            metricType={metricType}
+                            chartType={chartType}
+                            timeRange={timeRange}
+                            totalEstimatedCost={totalEstimatedCost}
+                            cacheMetrics={cacheMetrics}
+                            formatNumber={formatNumber}
+                            formatCurrency={formatCurrency}
+                            switchChartType={switchChartType}
+                            switchMetricType={switchMetricType}
+                            switchViewMode={switchViewMode}
+                            setShowPricingModal={setShowPricingModal}
+                            customTooltip={CustomTrendTooltip}
+                        />
+                        <ModelSpeedCard speedData={speedData} loading={loading} />
+                    </div>
                 )}
 
                 {/* ==================== 3. 经典看板模式 (Classic View) ==================== */}
@@ -1045,7 +1099,7 @@ const TokenStats: React.FC = () => {
                     <>
                         {/* 经典独立指标卡片 */}
                         {summary && (
-                            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-3">
+                            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
                                 {/* 总 Token */}
                                 <div className="bg-white dark:bg-base-100 rounded-2xl p-3.5 shadow-sm border border-gray-200/80 dark:border-base-200 flex flex-col justify-between">
                                     <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 text-xs mb-2">
@@ -1115,6 +1169,21 @@ const TokenStats: React.FC = () => {
                                     </div>
                                 </div>
 
+                                {/* 平均生成速度 */}
+                                <div className="bg-white dark:bg-base-100 rounded-2xl p-3.5 shadow-sm border border-gray-200/80 dark:border-base-200 flex flex-col justify-between">
+                                    <div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400 text-xs mb-2">
+                                        <div className="p-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-500/10">
+                                            <Zap className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                                        </div>
+                                        <span title={t('token_stats.avg_tps_tip', '全局样本平均 Token 输出速度')}>{t('token_stats.avg_output_tps', '输出速度')}</span>
+                                    </div>
+                                    <div className="text-xl font-bold font-mono tracking-tight text-emerald-600 dark:text-emerald-400">
+                                        {summary.avg_output_tps && summary.avg_output_tps > 0
+                                            ? `${summary.avg_output_tps.toFixed(1)} t/s`
+                                            : '-'}
+                                    </div>
+                                </div>
+
                                 {/* 活跃账号 */}
                                 <div className="bg-white dark:bg-base-100 rounded-2xl p-3.5 shadow-sm border border-gray-200/80 dark:border-base-200 flex flex-col justify-between">
                                     <div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400 text-xs mb-2">
@@ -1142,6 +1211,8 @@ const TokenStats: React.FC = () => {
                                 </div>
                             </div>
                         )}
+
+                        <ModelSpeedCard speedData={speedData} loading={loading} />
 
                         {/* 全宽趋势图 (Full-Width Trend Chart) */}
                         <div className="bg-white dark:bg-base-100 rounded-2xl p-4 sm:p-5 border border-gray-200/80 dark:border-base-200 shadow-sm flex flex-col justify-between">
@@ -1509,6 +1580,7 @@ const TokenStats: React.FC = () => {
                                         <th className="text-right py-2.5 px-3 font-medium">{t('token_stats.cached_token', '缓存命中')}</th>
                                         <th className="text-right py-2.5 px-3 font-medium">{t('token_stats.total', '合计')}</th>
                                         <th className="text-right py-2.5 px-3 font-medium" title={t('token_stats.avg_ttft_tip', '平均首字响应耗时')}>{t('token_stats.ttft', '首字耗时')}</th>
+                                        <th className="text-right py-2.5 px-3 font-medium" title={t('token_stats.avg_tps_tip', '平均输出速度')}>{t('token_stats.avg_output_tps', '输出速度')}</th>
                                         <th className="text-right py-2.5 px-3 font-medium">{t('token_stats.percentage', '占比')}</th>
                                         <th className="text-right py-2.5 px-3 font-medium">{t('token_stats.model_cost', '估算费用')}</th>
                                     </tr>
@@ -1550,6 +1622,11 @@ const TokenStats: React.FC = () => {
                                                         ? model.avg_ttft_ms < 1000
                                                             ? `${model.avg_ttft_ms.toFixed(0)} ms`
                                                             : `${(model.avg_ttft_ms / 1000).toFixed(2)} s`
+                                                        : '-'}
+                                                </td>
+                                                <td className="py-2.5 px-3 text-right font-mono text-emerald-600 dark:text-emerald-400 font-medium">
+                                                    {model.avg_output_tps && model.avg_output_tps > 0
+                                                        ? `${model.avg_output_tps.toFixed(1)} t/s`
                                                         : '-'}
                                                 </td>
                                                 <td className="py-2.5 px-3 text-right font-mono text-gray-500 dark:text-gray-400">

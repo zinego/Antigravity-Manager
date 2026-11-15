@@ -28,6 +28,8 @@ pub struct TokenData {
     pub service_account: Option<crate::modules::vertex::ServiceAccountCredentials>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vertex_location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertex_credit: Option<crate::modules::vertex::VertexCreditConfig>,
 }
 
 impl TokenData {
@@ -56,6 +58,7 @@ impl TokenData {
             id_token,
             service_account: None,
             vertex_location: None,
+            vertex_credit: None,
         }
     }
 

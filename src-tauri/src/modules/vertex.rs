@@ -1,7 +1,9 @@
 use crate::models::quota::{ModelQuota, QuotaData};
+use crate::models::Account;
 use dashmap::DashMap;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use once_cell::sync::Lazy;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -103,6 +105,71 @@ pub fn get_vertex_account_meta(account_id: &str) -> Option<VertexAccountMeta> {
     VERTEX_ACCOUNT_REGISTRY
         .get(account_id)
         .map(|entry| entry.value().clone())
+}
+
+fn default_credit_currency() -> String {
+    "USD".to_string()
+}
+
+fn default_exchange_rate() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VertexCreditConfig {
+    #[serde(default)]
+    pub initial_credit: f64,
+    #[serde(default = "default_credit_currency")]
+    pub currency: String,
+    #[serde(default)]
+    pub external_spent: f64,
+    #[serde(default = "default_exchange_rate")]
+    pub exchange_rate: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_timestamp: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+impl Default for VertexCreditConfig {
+    fn default() -> Self {
+        Self {
+            initial_credit: 300.0,
+            currency: "USD".to_string(),
+            external_spent: 0.0,
+            exchange_rate: 1.0,
+            baseline_timestamp: None,
+            billing_account_id: None,
+            expires_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VertexAccountInfo {
+    pub project_id: String,
+    pub location: String,
+    pub client_email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_account_id: Option<String>,
+    pub credit_configured: bool,
+    pub initial_credit: f64,
+    pub currency: String,
+    pub external_spent: f64,
+    pub exchange_rate: f64,
+    pub local_estimated_spent_usd: f64,
+    pub total_spent: f64,
+    pub remaining_credit: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_timestamp: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub total_requests: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cached_tokens: u64,
 }
 
 pub fn normalize_vertex_location(location: Option<&str>) -> String {
@@ -686,6 +753,176 @@ pub fn build_synthetic_vertex_quota() -> QuotaData {
     }
 
     quota
+}
+
+/// Estimate Vertex Gemini model cost in USD based on standard published pricing.
+/// Note: billable_input = input_tokens.saturating_sub(cached_tokens) so cached tokens
+/// are charged at the cached prompt token rate rather than double-charged.
+pub fn estimate_vertex_model_cost_usd(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    reasoning_tokens: u64,
+) -> f64 {
+    let clean = model.trim().to_lowercase();
+    let effective_output = output_tokens.saturating_add(reasoning_tokens);
+    let billable_input = input_tokens.saturating_sub(cached_tokens);
+
+    // Standard Vertex AI per 1,000,000 token rates: (prompt_rate, completion_rate, cached_prompt_rate)
+    let (p_in, p_out, p_cache) = if clean.contains("2.5-pro")
+        || clean.contains("2-5-pro")
+        || clean.contains("3.1-pro")
+        || clean.contains("3-pro")
+        || clean.contains("carbon")
+    {
+        // Gemini 2.5 Pro / 3.1 Pro / Carbon tier: .25 / .00 / bash.3125 per 1M tokens
+        (1.25, 5.00, 0.3125)
+    } else if clean.contains("hydrogen") || clean.contains("ultra") {
+        // High reasoning / Flagship Hydrogen tier: .00 / .00 / bash.50 per 1M tokens
+        (2.00, 8.00, 0.50)
+    } else if clean.contains("2.5-flash")
+        || clean.contains("2-5-flash")
+        || clean.contains("3.8-flash")
+        || clean.contains("3-flash")
+        || clean.contains("2.0-flash")
+        || clean.contains("flash")
+    {
+        // Gemini 2.5/3.8 Flash tier: bash.075 / bash.30 / bash.01875 per 1M tokens
+        (0.075, 0.30, 0.01875)
+    } else {
+        // Fallback default (flash tier rate): bash.075 / bash.30 / bash.01875 per 1M tokens
+        (0.075, 0.30, 0.01875)
+    };
+
+    let cost_input = (billable_input as f64 * p_in) / 1_000_000.0;
+    let cost_cached = (cached_tokens as f64 * p_cache) / 1_000_000.0;
+    let cost_output = (effective_output as f64 * p_out) / 1_000_000.0;
+
+    cost_input + cost_cached + cost_output
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct VertexUsageStats {
+    pub total_requests: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cached_tokens: u64,
+    pub local_estimated_spent_usd: f64,
+}
+
+/// Query token_stats.db for historical usage of the given account email.
+/// Safely returns empty stats if the database does not exist or table is uninitialized.
+pub fn query_vertex_account_usage(
+    account_email: &str,
+    baseline_timestamp: Option<i64>,
+) -> VertexUsageStats {
+    let mut stats = VertexUsageStats::default();
+    let Ok(data_dir) = crate::modules::account::get_data_dir() else {
+        return stats;
+    };
+    let db_path = data_dir.join("token_stats.db");
+    if !db_path.exists() {
+        return stats;
+    }
+
+    let Ok(conn) = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return stats;
+    };
+
+    let baseline = baseline_timestamp.unwrap_or(0);
+    let mut stmt = match conn.prepare(
+        "SELECT model, COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cached_tokens), 0), COALESCE(SUM(reasoning_tokens), 0)
+         FROM token_usage
+         WHERE account_email = ?1 AND timestamp >= ?2
+         GROUP BY model",
+    ) {
+        Ok(s) => s,
+        Err(_) => return stats,
+    };
+
+    let rows = match stmt.query_map(rusqlite::params![account_email, baseline], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? as u64,
+            row.get::<_, i64>(2)? as u64,
+            row.get::<_, i64>(3)? as u64,
+            row.get::<_, i64>(4)? as u64,
+            row.get::<_, i64>(5)? as u64,
+        ))
+    }) {
+        Ok(r) => r,
+        Err(_) => return stats,
+    };
+
+    for row in rows.flatten() {
+        let (model, count, in_tok, out_tok, cached_tok, reasoning_tok) = row;
+        stats.total_requests += count;
+        stats.total_input_tokens += in_tok;
+        stats.total_output_tokens += out_tok + reasoning_tok;
+        stats.total_cached_tokens += cached_tok;
+        stats.local_estimated_spent_usd +=
+            estimate_vertex_model_cost_usd(&model, in_tok, out_tok, cached_tok, reasoning_tok);
+    }
+
+    stats
+}
+
+/// Builds a comprehensive VertexAccountInfo DTO for an account.
+/// Returns None if the account is not a Vertex service account.
+pub fn build_vertex_account_info(account: &Account) -> Option<VertexAccountInfo> {
+    let sa = account.token.service_account.as_ref()?;
+    let location = normalize_vertex_location(account.token.vertex_location.as_deref());
+    let project_id = account
+        .token
+        .project_id
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| sa.project_id.clone());
+
+    let credit_cfg = account.token.vertex_credit.clone().unwrap_or_default();
+    let credit_configured = account.token.vertex_credit.is_some();
+    let baseline = credit_cfg.baseline_timestamp;
+    let stats = query_vertex_account_usage(&account.email, baseline);
+
+    let exchange_rate = if credit_cfg.exchange_rate > 0.0 {
+        credit_cfg.exchange_rate
+    } else {
+        1.0
+    };
+
+    let local_spent_in_currency = stats.local_estimated_spent_usd * exchange_rate;
+    let total_spent = credit_cfg.external_spent + local_spent_in_currency;
+    let remaining_credit = (credit_cfg.initial_credit - total_spent).max(0.0);
+
+    let billing_account_id = credit_cfg
+        .billing_account_id
+        .filter(|b| !b.trim().is_empty());
+    let expires_at = credit_cfg.expires_at.filter(|e| !e.trim().is_empty());
+
+    Some(VertexAccountInfo {
+        project_id,
+        location,
+        client_email: sa.client_email.clone(),
+        billing_account_id,
+        credit_configured,
+        initial_credit: credit_cfg.initial_credit,
+        currency: credit_cfg.currency,
+        external_spent: credit_cfg.external_spent,
+        exchange_rate,
+        local_estimated_spent_usd: stats.local_estimated_spent_usd,
+        total_spent,
+        remaining_credit,
+        baseline_timestamp: baseline,
+        expires_at,
+        total_requests: stats.total_requests,
+        total_input_tokens: stats.total_input_tokens,
+        total_output_tokens: stats.total_output_tokens,
+        total_cached_tokens: stats.total_cached_tokens,
+    })
 }
 
 #[cfg(test)]
@@ -1274,5 +1511,127 @@ mod tests {
             crate::proxy::model_specs::get_max_output_tokens("gemini-4-carbon-high", None),
             262_144
         );
+    }
+
+    #[test]
+    fn test_vertex_pricing_estimation_and_caching() {
+        // Flash tier test: 1M billable input (bash.075), 1M output (bash.30), 1M cached (bash.01875)
+        // input_tokens=2M, cached_tokens=1M -> billable_input = 1M
+        let cost =
+            estimate_vertex_model_cost_usd("gemini-2.5-flash", 2_000_000, 1_000_000, 1_000_000, 0);
+        let expected = 0.075 + 0.30 + 0.01875;
+        assert!(
+            (cost - expected).abs() < 1e-6,
+            "Expected {}, got {}",
+            expected,
+            cost
+        );
+
+        // Pro tier test: 1M billable input (.25), 1M output (.00), 1M cached (bash.3125)
+        let cost_pro = estimate_vertex_model_cost_usd(
+            "gemini-3.1-pro-preview",
+            1_500_000,
+            1_000_000,
+            500_000,
+            0,
+        );
+        let expected_pro = 1.25 + 5.00 + (0.5 * 0.3125);
+        assert!(
+            (cost_pro - expected_pro).abs() < 1e-6,
+            "Expected {}, got {}",
+            expected_pro,
+            cost_pro
+        );
+
+        // Reasoning tokens added to output
+        let cost_reasoning =
+            estimate_vertex_model_cost_usd("gemini-2.5-flash", 1_000_000, 500_000, 0, 500_000);
+        let expected_reasoning = 0.075 + 0.30;
+        assert!((cost_reasoning - expected_reasoning).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_vertex_credit_config_serde_backward_compatibility() {
+        let empty_json = "{}";
+        let parsed: VertexCreditConfig = serde_json::from_str(empty_json).unwrap();
+        assert_eq!(parsed.initial_credit, 0.0);
+        assert_eq!(parsed.currency, "USD");
+        assert_eq!(parsed.external_spent, 0.0);
+        assert_eq!(parsed.exchange_rate, 1.0);
+        assert_eq!(parsed.baseline_timestamp, None);
+        assert_eq!(parsed.billing_account_id, None);
+        assert_eq!(parsed.expires_at, None);
+
+        let full_json = r#"{
+            "initial_credit": 45000.0,
+            "currency": "JPY",
+            "external_spent": 5000.0,
+            "exchange_rate": 155.0,
+            "baseline_timestamp": 1730000000,
+            "billing_account_id": "012FA9-D7D39F-27BD53",
+            "expires_at": "2027-02-12"
+        }"#;
+        let full_cfg: VertexCreditConfig = serde_json::from_str(full_json).unwrap();
+        assert_eq!(full_cfg.initial_credit, 45000.0);
+        assert_eq!(full_cfg.currency, "JPY");
+        assert_eq!(full_cfg.exchange_rate, 155.0);
+        assert_eq!(
+            full_cfg.billing_account_id.as_deref(),
+            Some("012FA9-D7D39F-27BD53")
+        );
+    }
+
+    #[test]
+    fn test_build_vertex_account_info_with_and_without_credit_config() {
+        let sa_json = sample_sa_json();
+        let parsed = parse_vertex_credentials(&sa_json).unwrap().unwrap();
+        let mut token = crate::models::TokenData::new(
+            "mock_token".to_string(),
+            "mock_refresh".to_string(),
+            3600,
+            Some(parsed.service_account.client_email.clone()),
+            Some(parsed.service_account.project_id.clone()),
+            None,
+            true,
+            None,
+        );
+        token.service_account = Some(parsed.service_account.clone());
+        token.vertex_location = Some("us-central1".to_string());
+
+        let mut acc = crate::models::Account::new(
+            "acc-test-vertex".to_string(),
+            parsed.service_account.client_email.clone(),
+            token,
+        );
+
+        // 1. Without credit config
+        let info_default = build_vertex_account_info(&acc).expect("must build info");
+        assert_eq!(info_default.project_id, "proj-vertex-123");
+        assert_eq!(info_default.location, "us-central1");
+        assert_eq!(info_default.credit_configured, false);
+        assert_eq!(info_default.currency, "USD");
+        assert_eq!(info_default.initial_credit, 300.0);
+
+        // 2. With credit config (e.g. JPY)
+        acc.token.vertex_credit = Some(VertexCreditConfig {
+            initial_credit: 45000.0,
+            currency: "JPY".to_string(),
+            external_spent: 1000.0,
+            exchange_rate: 150.0,
+            baseline_timestamp: Some(1730000000),
+            billing_account_id: Some("012FA9-D7D39F-27BD53".to_string()),
+            expires_at: Some("2027-02-12".to_string()),
+        });
+
+        let info_jpy = build_vertex_account_info(&acc).expect("must build info with jpy");
+        assert_eq!(info_jpy.credit_configured, true);
+        assert_eq!(info_jpy.currency, "JPY");
+        assert_eq!(info_jpy.initial_credit, 45000.0);
+        assert_eq!(info_jpy.exchange_rate, 150.0);
+        assert_eq!(
+            info_jpy.billing_account_id.as_deref(),
+            Some("012FA9-D7D39F-27BD53")
+        );
+        assert_eq!(info_jpy.expires_at.as_deref(), Some("2027-02-12"));
     }
 }

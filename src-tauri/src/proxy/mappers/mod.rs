@@ -11,6 +11,7 @@ pub mod estimation_calibrator;
 pub mod gemini;
 pub mod model_limits;
 pub mod openai;
+pub mod prompt_rewrite;
 pub mod prompt_sanitizer;
 pub mod rtk_cleaner;
 pub mod signature_store;

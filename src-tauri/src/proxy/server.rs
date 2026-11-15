@@ -304,6 +304,8 @@ struct AccountResponse {
     qos_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     qos_reset_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vertex_info: Option<crate::modules::vertex::VertexAccountInfo>,
 }
 
 #[derive(Serialize)]
@@ -416,6 +418,11 @@ fn to_account_response(
         validation_url: account.validation_url.clone(),
         qos_status: account.qos_status.clone(),
         qos_reset_seconds: account.qos_reset_seconds,
+        vertex_info: if account.token.is_vertex_service_account() {
+            crate::modules::vertex::build_vertex_account_info(account)
+        } else {
+            None
+        },
     }
 }
 
@@ -800,6 +807,7 @@ impl AxumServer {
             .route("/stats/weekly", get(admin_get_token_stats_weekly))
             .route("/stats/accounts", get(admin_get_token_stats_by_account))
             .route("/stats/models", get(admin_get_token_stats_by_model))
+            .route("/stats/model-speed", get(admin_get_token_stats_model_speed))
             .route("/config", get(admin_get_config).post(admin_save_config))
             .route("/proxy/cli/status", post(admin_get_cli_sync_status))
             .route("/proxy/cli/sync", post(admin_execute_cli_sync))
@@ -956,6 +964,10 @@ impl AxumServer {
             .route("/stats/token/summary", get(admin_get_token_stats_summary))
             .route("/stats/token/by-model", get(admin_get_token_stats_by_model))
             .route(
+                "/stats/token/model-speed",
+                get(admin_get_token_stats_model_speed),
+            )
+            .route(
                 "/stats/token/model-trend/hourly",
                 get(admin_get_token_stats_model_trend_hourly),
             )
@@ -985,6 +997,10 @@ impl AxumServer {
             .route(
                 "/accounts/:accountId/priority",
                 post(admin_update_account_priority),
+            )
+            .route(
+                "/accounts/:accountId/vertex-credit",
+                post(admin_update_vertex_credit_config),
             )
             .route(
                 "/system/data-dir",
@@ -1391,6 +1407,11 @@ async fn admin_list_accounts(
     let account_responses: Vec<AccountResponse> = accounts
         .into_iter()
         .map(|acc| {
+            let vertex_info = if acc.token.is_vertex_service_account() {
+                crate::modules::vertex::build_vertex_account_info(&acc)
+            } else {
+                None
+            };
             let is_current = current_id.as_ref().map(|id| id == &acc.id).unwrap_or(false);
             let quota = acc.quota.map(|q| QuotaResponse {
                 models: q
@@ -1454,6 +1475,7 @@ async fn admin_list_accounts(
                 last_used: acc.last_used,
                 qos_status,
                 qos_reset_seconds,
+                vertex_info,
             }
         })
         .collect();
@@ -1498,6 +1520,11 @@ async fn admin_get_current_account(
     let response = if let Some(id) = current_id {
         let acc = account::load_account(&id).ok();
         acc.map(|acc| {
+            let vertex_info = if acc.token.is_vertex_service_account() {
+                crate::modules::vertex::build_vertex_account_info(&acc)
+            } else {
+                None
+            };
             let quota = acc.quota.map(|q| QuotaResponse {
                 models: q
                     .models
@@ -1560,6 +1587,7 @@ async fn admin_get_current_account(
                 last_used: acc.last_used,
                 qos_status,
                 qos_reset_seconds,
+                vertex_info,
             }
         })
     } else {
@@ -2126,6 +2154,7 @@ async fn admin_save_config(
     crate::proxy::update_sensitive_word_obfuscation_config(
         new_config.proxy.sensitive_word_obfuscation.clone(),
     );
+    crate::proxy::update_prompt_rewrite_config(new_config.proxy.prompt_rewrite.clone());
     crate::proxy::update_image_thinking_mode(new_config.proxy.image_thinking_mode.clone());
     crate::proxy::update_multimodal_config(new_config.proxy.multimodal.clone());
     crate::proxy::update_stream_timeout_config(new_config.proxy.stream_timeouts.clone());
@@ -2871,6 +2900,7 @@ struct StatsPeriodQuery {
     hours: Option<i64>,
     days: Option<i64>,
     weeks: Option<i64>,
+    buckets: Option<i64>,
     view_mode: Option<String>,
 }
 
@@ -2963,6 +2993,32 @@ async fn admin_get_token_stats_summary(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let hours = p.hours.unwrap_or(168);
     let res = tokio::task::spawn_blocking(move || token_stats::get_summary_stats(hours)).await;
+
+    match res {
+        Ok(Ok(stats)) => Ok(Json(stats)),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+async fn admin_get_token_stats_model_speed(
+    Query(p): Query<StatsPeriodQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let hours = p.hours.unwrap_or(24);
+    let buckets = p.buckets;
+    let view_mode = p.view_mode;
+    let res = tokio::task::spawn_blocking(move || {
+        token_stats::get_model_speed_stats(hours, buckets, view_mode.as_deref())
+    })
+    .await;
 
     match res {
         Ok(Ok(stats)) => Ok(Json(stats)),
@@ -3425,6 +3481,40 @@ async fn admin_update_account_priority(
         .token_manager
         .update_account_priority(&account_id, payload.priority);
     Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum UpdateVertexCreditPayload {
+    Nested {
+        config: crate::modules::vertex::VertexCreditConfig,
+    },
+    Direct(crate::modules::vertex::VertexCreditConfig),
+}
+
+async fn admin_update_vertex_credit_config(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Json(payload): Json<UpdateVertexCreditPayload>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let config = match payload {
+        UpdateVertexCreditPayload::Nested { config } => config,
+        UpdateVertexCreditPayload::Direct(config) => config,
+    };
+
+    let updated_account = crate::modules::account::update_vertex_credit_config(&account_id, config)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+
+    // Reload account in TokenManager if active
+    let _ = state.token_manager.reload_account(&account_id).await;
+
+    let current_id = state.account_service.get_current_id().ok().flatten();
+    Ok(Json(to_account_response(&updated_account, &current_id)))
 }
 
 async fn admin_toggle_proxy_status(

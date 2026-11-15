@@ -536,14 +536,25 @@ const LogTable: React.FC<LogTableProps> = ({
                                         const ttftText = ttftMs != null 
                                             ? (ttftMs >= 1000 ? `${(ttftMs / 1000).toFixed(2)}s` : `${Math.round(ttftMs)}ms`)
                                             : null;
+                                        const tps = (log.duration > 0 && (log.output_tokens || 0) > 0)
+                                            ? ((log.output_tokens || 0) / (log.duration / 1000))
+                                            : null;
+                                        const tpsText = tps != null ? `${tps >= 100 ? tps.toFixed(0) : tps.toFixed(1)} t/s` : null;
                                         return (
                                             <div 
                                                 className="flex flex-col items-end gap-0.5 overflow-hidden max-w-full"
-                                                title={`${t('monitor.table.total_duration_title', '总耗时')}: ${durationText}${ttftText ? ` | ${t('monitor.table.ttft_title', '首字延迟 (TTFT)')}: ${ttftText}` : ''}`}
+                                                title={`${t('monitor.table.total_duration_title', '总耗时')}: ${durationText}${ttftText ? ` | ${t('monitor.table.ttft_title', '首字延迟 (TTFT)')}: ${ttftText}` : ''}${tpsText ? ` | ${t('monitor.table.tps_title', '输出速度')}: ${tpsText}` : ''}`}
                                             >
-                                                <span className={`text-xs font-mono font-medium truncate max-w-full ${durationColor}`}>
-                                                    {durationText}
-                                                </span>
+                                                <div className="flex items-center justify-end gap-1 max-w-full">
+                                                    {tpsText && (
+                                                        <span className="text-[10px] font-mono px-1 py-0.2 rounded bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-400 font-medium shrink-0">
+                                                            {tpsText}
+                                                        </span>
+                                                    )}
+                                                    <span className={`text-xs font-mono font-medium truncate max-w-full ${durationColor}`}>
+                                                        {durationText}
+                                                    </span>
+                                                </div>
                                                 {ttftText ? (
                                                     <span className="text-[11px] font-mono text-sky-600 dark:text-sky-400 truncate max-w-full">
                                                         {t('monitor.table.ttft_prefix', '首字:')} {ttftText}

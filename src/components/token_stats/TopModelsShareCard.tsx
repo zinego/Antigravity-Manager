@@ -11,6 +11,7 @@ export interface ModelShareItem {
     total_cached_tokens: number;
     cost: number;
     avg_ttft_ms?: number;
+    avg_output_tps?: number;
 }
 
 interface TopModelsShareCardProps {

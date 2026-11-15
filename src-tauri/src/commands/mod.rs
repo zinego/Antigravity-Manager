@@ -558,6 +558,7 @@ pub async fn save_config(
     crate::proxy::update_sensitive_word_obfuscation_config(
         config.proxy.sensitive_word_obfuscation.clone(),
     );
+    crate::proxy::update_prompt_rewrite_config(config.proxy.prompt_rewrite.clone());
     crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
     crate::proxy::update_multimodal_config(config.proxy.multimodal.clone());
     crate::proxy::update_stream_timeout_config(config.proxy.stream_timeouts.clone());
@@ -613,6 +614,7 @@ pub async fn save_config(
         crate::proxy::update_sensitive_word_obfuscation_config(
             config.proxy.sensitive_word_obfuscation.clone(),
         );
+        crate::proxy::update_prompt_rewrite_config(config.proxy.prompt_rewrite.clone());
         // [NEW] 更新全局图像思维模式配置
         crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
         crate::proxy::update_multimodal_config(config.proxy.multimodal.clone());
@@ -1579,6 +1581,14 @@ pub async fn auto_fetch_account_project_id(
     Ok(pid)
 }
 
+#[tauri::command]
+pub async fn update_vertex_credit_config(
+    account_id: String,
+    config: crate::modules::vertex::VertexCreditConfig,
+) -> Result<crate::models::account::Account, String> {
+    modules::account::update_vertex_credit_config(&account_id, config)
+}
+
 /// 更新账号自定义标签
 #[tauri::command]
 pub async fn update_account_label(account_id: String, label: String) -> Result<(), String> {
@@ -1737,6 +1747,15 @@ pub async fn get_token_stats_account_trend_hourly(
     hours: i64,
 ) -> Result<Vec<crate::modules::token_stats::AccountTrendPoint>, String> {
     crate::modules::token_stats::get_account_trend_hourly(hours)
+}
+
+#[tauri::command]
+pub async fn get_token_stats_model_speed(
+    hours: i64,
+    buckets: Option<i64>,
+    view_mode: Option<String>,
+) -> Result<crate::modules::token_stats::ModelSpeedResponse, String> {
+    crate::modules::token_stats::get_model_speed_stats(hours, buckets, view_mode.as_deref())
 }
 
 #[tauri::command]

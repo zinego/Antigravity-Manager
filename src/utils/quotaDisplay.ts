@@ -527,3 +527,16 @@ export function getGroupQuotaSummaries(
     return summaries;
 }
 
+
+
+export function formatCurrencyAmount(amount: number, currency: string = "USD"): string {
+    const curr = (currency || "USD").toUpperCase();
+    const safeAmount = Number.isFinite(amount) ? amount : 0;
+    if (curr === "JPY" || curr === "CNY") {
+        return (curr === "JPY" ? "¥" : "¥") + Math.round(safeAmount).toLocaleString();
+    }
+    if (curr === "EUR") {
+        return "€" + safeAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    return "$" + safeAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}

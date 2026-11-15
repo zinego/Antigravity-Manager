@@ -883,6 +883,7 @@ pub fn run() {
             commands::update_account_priority,
             commands::update_account_project_id,
             commands::auto_fetch_account_project_id,
+            commands::update_vertex_credit_config,
             // HTTP API settings commands
             commands::get_http_api_settings,
             commands::save_http_api_settings,
@@ -900,6 +901,7 @@ pub fn run() {
             commands::get_token_stats_account_trend_minute,
             commands::get_token_stats_account_trend_hourly,
             commands::get_token_stats_account_trend_daily,
+            commands::get_token_stats_model_speed,
             proxy::cli_sync::get_cli_sync_status,
             proxy::cli_sync::execute_cli_sync,
             proxy::cli_sync::execute_cli_restore,

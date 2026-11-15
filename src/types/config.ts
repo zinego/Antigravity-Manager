@@ -30,6 +30,7 @@ export interface ProxyConfig {
     thinking_budget?: ThinkingBudgetConfig;
     global_system_prompt?: GlobalSystemPromptConfig;
     sensitive_word_obfuscation?: SensitiveWordObfuscationConfig;
+    prompt_rewrite?: PromptRewriteConfig;
     image_thinking_mode?: 'enabled' | 'disabled'; // [NEW] 图像思维模式开关
     only_raw_quota_models?: boolean; // [NEW] 是否只暴露真实配额模型
     proxy_pool?: ProxyPoolConfig;
@@ -149,6 +150,20 @@ export interface SensitiveWordObfuscationConfig {
     enabled: boolean;
     scope: SensitiveWordObfuscationScope;
     sensitive_words: string[];
+}
+
+export type PromptRewriteScope = "system_instruction" | "system_and_messages";
+
+export interface PromptRewriteRule {
+    enabled: boolean;
+    match: string;
+    replace: string;
+}
+
+export interface PromptRewriteConfig {
+    enabled: boolean;
+    scope: PromptRewriteScope;
+    rules: PromptRewriteRule[];
 }
 
 export interface DebugLoggingConfig {

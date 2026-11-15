@@ -105,6 +105,9 @@ pub struct Account {
     /// [NEW] 运行时 QoS 冷却剩余时间 (秒)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qos_reset_seconds: Option<u64>,
+    /// [NEW] Vertex AI 账号额度、消费与关联配置快照
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertex_info: Option<crate::modules::vertex::VertexAccountInfo>,
 }
 
 impl Account {
@@ -138,6 +141,7 @@ impl Account {
             custom_label: None,
             qos_status: None,
             qos_reset_seconds: None,
+            vertex_info: None,
         }
     }
 
@@ -149,6 +153,9 @@ impl Account {
         let mut cloned = self.clone();
         if let Some(sa) = cloned.token.service_account.as_ref() {
             cloned.token.service_account = Some(sa.redacted());
+        }
+        if cloned.token.is_vertex_service_account() {
+            cloned.vertex_info = crate::modules::vertex::build_vertex_account_info(&cloned);
         }
         cloned
     }

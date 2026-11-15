@@ -1,5 +1,7 @@
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, ToggleLeft, ToggleRight, Fingerprint } from 'lucide-react';
-import { Account, getAccountTier } from '../../types/account';
+import { useMemo } from 'react';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, Clock, ToggleLeft, ToggleRight, Fingerprint, Globe, Coins } from 'lucide-react';
+import { Account, getAccountTier, isVertexAccount, VertexAccountInfo } from '../../types/account';
+import { formatCurrencyAmount } from '../../utils/quotaDisplay';
 import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../../utils/format';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
@@ -28,6 +30,38 @@ interface AccountRowProps {
 function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice }: AccountRowProps) {
     const { t } = useTranslation();
     // [重构] 按优先级查找配额模型
+    const isVertex = useMemo(() => isVertexAccount(account), [account]);
+    const vertexInfo: VertexAccountInfo | undefined = useMemo(() => {
+        if (account.vertex_info) return account.vertex_info;
+        if (!isVertex) return undefined;
+        const sa = account.token?.service_account;
+        const cred = account.token?.vertex_credit;
+        const projectId = account.token?.project_id || sa?.project_id || "";
+        const location = account.token?.vertex_location || "global";
+        const initial = cred?.initial_credit ?? 300.0;
+        const currency = cred?.currency || "USD";
+        const spent = cred?.external_spent ?? 0.0;
+        return {
+            project_id: projectId,
+            location,
+            client_email: sa?.client_email || account.email,
+            billing_account_id: cred?.billing_account_id,
+            credit_configured: Boolean(cred),
+            initial_credit: initial,
+            currency,
+            external_spent: spent,
+            exchange_rate: cred?.exchange_rate ?? 1.0,
+            local_estimated_spent_usd: 0.0,
+            total_spent: spent,
+            remaining_credit: Math.max(0, initial - spent),
+            baseline_timestamp: cred?.baseline_timestamp,
+            expires_at: cred?.expires_at,
+            total_requests: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cached_tokens: 0,
+        };
+    }, [account, isVertex]);
     const geminiProModel = findQuotaModel(account.quota?.models, 'gemini-pro');
     const geminiFlashModel = findQuotaModel(account.quota?.models, 'gemini-flash');
 
@@ -143,6 +177,13 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                                         ULTRA
                                     </span>
                                 );
+                            } else if (tier === 'enterprise') {
+                                return (
+                                    <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-emerald-600 to-teal-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default" title={account.token?.project_id ? `GCP: ${account.token.project_id}` : 'GCP / Vertex AI Enterprise'}>
+                                        <Diamond className="w-2.5 h-2.5 fill-current" />
+                                        ENTERPRISE
+                                    </span>
+                                );
                             } else if (tier === 'pro') {
                                 return (
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
@@ -165,7 +206,56 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
 
             {/* 模型配额 */}
             <td className="px-4 py-1">
-                {account.quota?.is_forbidden ? (
+                {isVertex ? (
+                    <div className="flex items-center justify-between gap-3 px-2.5 py-1 rounded-lg border border-emerald-200/60 dark:border-emerald-800/40 bg-gradient-to-r from-emerald-50/50 via-teal-50/20 to-transparent dark:from-emerald-950/20 dark:via-base-100">
+                        <div className="flex items-center gap-2 min-w-0">
+                            <span className="px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/50 text-emerald-800 dark:text-emerald-300 font-mono text-[9px] font-bold flex items-center gap-1 shrink-0">
+                                <Globe className="w-2.5 h-2.5" />
+                                {vertexInfo?.location || 'global'}
+                            </span>
+                            <span className="font-mono text-xs font-semibold text-gray-800 dark:text-gray-200 truncate" title={vertexInfo?.project_id}>
+                                {vertexInfo?.project_id || t('accounts.vertex.no_project', { defaultValue: '未关联 Project ID' })}
+                            </span>
+                        </div>
+
+                        {vertexInfo?.credit_configured ? (
+                            <div className="flex items-center gap-3 shrink-0">
+                                <div className="flex flex-col items-end">
+                                    <div className="flex items-baseline gap-1 font-mono text-[11px] font-bold text-emerald-700 dark:text-emerald-300">
+                                        <Coins className="w-3 h-3 text-emerald-500 inline mr-0.5" />
+                                        <span>{formatCurrencyAmount(vertexInfo.remaining_credit, vertexInfo.currency)}</span>
+                                        <span className="text-[9px] font-normal text-gray-400">
+                                            / {formatCurrencyAmount(vertexInfo.initial_credit, vertexInfo.currency)}
+                                        </span>
+                                    </div>
+                                    <div className="w-24 h-1 bg-gray-200 dark:bg-base-200 rounded-full overflow-hidden mt-0.5">
+                                        <div
+                                            className="h-full bg-gradient-to-r from-emerald-500 to-teal-500 rounded-full"
+                                            style={{
+                                                width: `${Math.min(100, Math.max(0, (vertexInfo?.initial_credit || 0) > 0 ? ((vertexInfo?.remaining_credit || 0) / (vertexInfo?.initial_credit || 1)) * 100 : 0))}%`
+                                            }}
+                                        />
+                                    </div>
+                                </div>
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
+                                    className="text-[10px] text-gray-400 hover:text-emerald-600 dark:hover:text-emerald-400 font-mono"
+                                    title={t('accounts.vertex.calibrate', { defaultValue: '查看/校准赠金' })}
+                                >
+                                    {vertexInfo.expires_at || t('accounts.vertex.calibrate', { defaultValue: '校准' })}
+                                </button>
+                            </div>
+                        ) : (
+                            <button
+                                onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
+                                className="px-2 py-0.5 rounded border border-dashed border-emerald-300 dark:border-emerald-700 bg-white/70 dark:bg-base-100/50 hover:bg-emerald-50 text-emerald-700 dark:text-emerald-300 text-[10px] font-medium flex items-center gap-1 transition-all"
+                            >
+                                <Coins className="w-2.5 h-2.5 text-emerald-500" />
+                                <span>{t('accounts.vertex.setup_credit_hint', { defaultValue: '设置 $300 赠金跟踪' })}</span>
+                            </button>
+                        )}
+                    </div>
+                ) : account.quota?.is_forbidden ? (
                     <div className="flex items-center gap-2 text-xs text-red-500 dark:text-red-400 bg-red-50/50 dark:bg-red-900/10 p-1.5 rounded-lg border border-red-100 dark:border-red-900/30">
                         <Ban className="w-4 h-4 shrink-0" />
                         <span>{t('accounts.forbidden_msg')}</span>

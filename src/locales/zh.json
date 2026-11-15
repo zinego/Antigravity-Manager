@@ -866,6 +866,30 @@
             "placeholder": "输入需脱敏的词汇或短语，每行一个...\n例如：\nproxy\nClaude Code\nAnthropic\nOpenAI",
             "word_count": "已生效 {{count}} 个敏感词（≥2 字符）",
             "safe_notice": "思考块（thought）与签名严格保持原样"
+        },
+        "prompt_rewrite": {
+            "title": "提示词改写 (Prompt Rewrite)",
+            "badge_exact": "严格匹配",
+            "hint": "严格字面匹配并按顺序替换提示词中的特定词句，支持清空删除或重定向模型指令",
+            "scope_label": "生效作用域 (Scope)",
+            "scope_system_desc": "仅改写系统提示词 (systemInstruction)，对话消息与代码完全不受影响",
+            "scope_messages_desc": "改写系统提示词与对话上下文（自动保护围栏代码块中的代码不变）",
+            "scope_system_only": "仅系统提示词 (推荐)",
+            "scope_system_and_messages": "系统提示词 + 消息正文",
+            "rules_label": "改写规则列表（按顺序逐条执行）",
+            "empty_rules": "暂无改写规则，请在下方添加第一条规则",
+            "rule_num": "规则 #{{num}}",
+            "match_label": "严格匹配内容 (Match)",
+            "match_placeholder": "输入要精确匹配的词句（区分大小写，非正则字面匹配）...",
+            "replace_label": "替换为 (Replace With)",
+            "replace_placeholder": "输入替换后的内容（留空表示完全删除匹配项）...",
+            "add_rule": "添加改写规则",
+            "add_rule_title": "新建改写规则",
+            "rule_count": "已生效 {{count}} / {{total}} 条规则",
+            "safe_notice": "思考块（thought）严格受保护，围栏代码块内容在消息模式下自动保留",
+            "delete_rule": "删除规则",
+            "move_up": "上移",
+            "move_down": "下移"
         }
     },
     "tray": {
@@ -1874,7 +1898,8 @@
             "out_tokens_title": "输出 Token",
             "ttft_prefix": "首字:",
             "total_duration_title": "总耗时",
-            "ttft_title": "首字延迟"
+            "ttft_title": "首字延迟",
+            "tps_title": "输出速度"
         },
         "details": {
             "title": "请求详情",
@@ -2199,7 +2224,31 @@
         "cockpit_tab_users": "用户",
         "avg_ttft": "首字延迟",
         "ttft": "首字耗时",
-        "avg_ttft_tip": "平均首字响应耗时"
+        "avg_ttft_tip": "平均首字响应耗时",
+        "avg_output_tps": "输出速度",
+        "avg_tps_tip": "全局平均输出速度",
+        "speed": {
+            "title": "Token 输出速度看板",
+            "subtitle": "基于单次请求纯净耗时与输出 Token 计算生成速率与首字响应",
+            "mode_trend": "分时趋势",
+            "mode_trend_tip": "分时分桶趋势图 (Lollipop / Curve)",
+            "mode_dumbbell": "半窗对比",
+            "mode_dumbbell_tip": "时间窗口前后半段测速对比 (Dumbbell)",
+            "kpi_weighted_tps": "加权生成速度",
+            "kpi_sample_mean_tps": "样本平均速度",
+            "kpi_p95_ttft": "P95 首字延迟",
+            "kpi_samples": "测速样本总量",
+            "models_selected": "对比模型 (最多5个):",
+            "reset_top5": "Top 5",
+            "reset_top5_tip": "恢复选择采样最多的前 5 个模型",
+            "empty_title": "暂无耗时测速样本",
+            "empty_hint": "代理网关在处理新请求时将自动抓取 duration_ms 并计算实时 Token 输出速度。",
+            "col_model": "模型与分布",
+            "col_comparison": "前半段 (○) ➔ 后半段 (●)",
+            "col_metrics": "P95 首字 / 样本数",
+            "insufficient_samples": "样本集中在单侧，暂无半窗对比",
+            "requests_unit": "请求"
+        }
     },
     "errors": {
         "stream": {

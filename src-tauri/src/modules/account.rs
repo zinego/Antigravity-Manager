@@ -1724,6 +1724,23 @@ pub fn update_account_project_id(
     save_account(&account)
 }
 
+/// Update Vertex AI credit balance tracking configuration for an account.
+pub fn update_vertex_credit_config(
+    account_id: &str,
+    config: crate::modules::vertex::VertexCreditConfig,
+) -> Result<Account, String> {
+    let _account_write = lock_account_file_updates()?;
+    let mut account = load_account(account_id)?;
+
+    account.token.vertex_credit = Some(config);
+    save_account(&account)?;
+
+    // Return the updated account with refreshed vertex_info snapshot
+    let mut res = account.redacted_for_ipc();
+    res.vertex_info = crate::modules::vertex::build_vertex_account_info(&account);
+    Ok(res)
+}
+
 /// Automatically fetch and associate Project ID from upstream for a given account.
 pub async fn auto_fetch_account_project_id(account_id: &str) -> Result<String, String> {
     let mut account = load_account(account_id)?;

@@ -496,6 +496,7 @@ impl ProxyMonitor {
             let cached = log.cached_tokens.unwrap_or(0);
             let reasoning = log.reasoning_tokens.unwrap_or(0);
             let ttft_ms = log.ttft_ms();
+            let duration_ms = Some(log.duration as f64);
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = crate::modules::token_stats::record_usage(
                     &account,
@@ -506,6 +507,7 @@ impl ProxyMonitor {
                     cached,
                     reasoning,
                     ttft_ms,
+                    duration_ms,
                 ) {
                     tracing::debug!("Failed to record token stats: {}", e);
                 }

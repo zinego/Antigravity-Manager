@@ -41,6 +41,8 @@ pub struct TokenStatsSummary {
     pub unique_accounts: u64,
     #[serde(default)]
     pub avg_ttft_ms: Option<f64>,
+    #[serde(default)]
+    pub avg_output_tps: Option<f64>,
 }
 
 /// Per-model token statistics
@@ -56,6 +58,65 @@ pub struct ModelTokenStats {
     pub request_count: u64,
     #[serde(default)]
     pub avg_ttft_ms: Option<f64>,
+    #[serde(default)]
+    pub avg_output_tps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSpeedBucketPoint {
+    pub avg_tps: f64,
+    pub sample_count: u64,
+    pub total_output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSpeedBucket {
+    pub label: String,
+    pub start_ts: i64,
+    pub end_ts: i64,
+    pub models: std::collections::HashMap<String, ModelSpeedBucketPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSpeedItem {
+    pub model: String,
+    pub sample_count: u64,
+    pub total_output_tokens: u64,
+    pub avg_tps: f64,
+    pub weighted_tps: f64,
+    pub min_tps: f64,
+    pub max_tps: f64,
+    #[serde(default)]
+    pub avg_ttft_ms: Option<f64>,
+    #[serde(default)]
+    pub p95_ttft_ms: Option<f64>,
+    #[serde(default)]
+    pub first_half_tps: Option<f64>,
+    #[serde(default)]
+    pub second_half_tps: Option<f64>,
+    #[serde(default)]
+    pub tps_delta: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSpeedGlobalSummary {
+    pub total_samples: u64,
+    pub total_output_tokens: u64,
+    #[serde(default)]
+    pub avg_tps: Option<f64>,
+    #[serde(default)]
+    pub weighted_tps: Option<f64>,
+    #[serde(default)]
+    pub avg_ttft_ms: Option<f64>,
+    #[serde(default)]
+    pub p95_ttft_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSpeedResponse {
+    pub summary: ModelSpeedGlobalSummary,
+    pub models: Vec<ModelSpeedItem>,
+    pub buckets: Vec<ModelSpeedBucket>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +237,7 @@ pub fn init_db() -> Result<(), String> {
     )?;
     add_column_if_missing(&conn, "token_usage", "requested_model TEXT")?;
     add_column_if_missing(&conn, "token_usage", "ttft_ms REAL")?;
+    add_column_if_missing(&conn, "token_usage", "duration_ms REAL")?;
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_token_requested_model ON token_usage (requested_model)",
         [],
@@ -245,6 +307,7 @@ pub fn record_usage(
     cached_tokens: u32,
     reasoning_tokens: u32,
     ttft_ms: Option<f64>,
+    duration_ms: Option<f64>,
 ) -> Result<(), String> {
     let conn = connect_db()?;
     let timestamp = chrono::Local::now().timestamp();
@@ -252,9 +315,9 @@ pub fn record_usage(
 
     // Insert into raw usage table
     conn.execute(
-        "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, ttft_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, ttft_ms],
+        "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, ttft_ms, duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, ttft_ms, duration_ms],
     ).map_err(|e| e.to_string())?;
 
     let hour_bucket = chrono::Local::now().format("%Y-%m-%d %H:00").to_string();
@@ -636,6 +699,14 @@ pub fn get_summary_stats(hours: i64) -> Result<TokenStatsSummary, String> {
         )
         .unwrap_or(None);
 
+    let avg_output_tps: Option<f64> = conn
+        .query_row(
+            "SELECT ROUND(AVG(CAST(output_tokens AS REAL) / (duration_ms / 1000.0)), 2) FROM token_usage WHERE timestamp >= ?1 AND duration_ms IS NOT NULL AND duration_ms > 0 AND output_tokens > 0",
+            [cutoff_timestamp],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+
     Ok(TokenStatsSummary {
         total_input_tokens: total_input,
         total_output_tokens: total_output,
@@ -645,6 +716,7 @@ pub fn get_summary_stats(hours: i64) -> Result<TokenStatsSummary, String> {
         total_requests: requests,
         unique_accounts,
         avg_ttft_ms,
+        avg_output_tps,
     })
 }
 
@@ -675,7 +747,8 @@ pub fn get_model_stats(
                 SUM(reasoning_tokens) as reasoning,
                 SUM(total_tokens) as total,
                 COUNT(*) as count,
-                ROUND(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms ELSE NULL END), 1) as avg_ttft
+                ROUND(AVG(CASE WHEN ttft_ms > 0 THEN ttft_ms ELSE NULL END), 1) as avg_ttft,
+                ROUND(AVG(CASE WHEN duration_ms > 0 AND output_tokens > 0 THEN CAST(output_tokens AS REAL) / (duration_ms / 1000.0) ELSE NULL END), 2) as avg_tps
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY agg_model
@@ -696,6 +769,7 @@ pub fn get_model_stats(
                 total_tokens: row.get(5)?,
                 request_count: row.get(6)?,
                 avg_ttft_ms: row.get(7)?,
+                avg_output_tps: row.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1001,6 +1075,348 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
         .collect())
 }
 
+/// Calculate model output speed statistics (TPS & TTFT), including summary, per-model stats, and time-bucketed trend series
+pub fn get_model_speed_stats(
+    hours: i64,
+    buckets: Option<i64>,
+    view_mode: Option<&str>,
+) -> Result<ModelSpeedResponse, String> {
+    let conn = connect_db()?;
+    get_model_speed_stats_with_conn(&conn, hours, buckets, view_mode)
+}
+
+pub(crate) fn get_model_speed_stats_with_conn(
+    conn: &Connection,
+    hours: i64,
+    buckets: Option<i64>,
+    view_mode: Option<&str>,
+) -> Result<ModelSpeedResponse, String> {
+    let now = chrono::Local::now().timestamp();
+    let (start_ts, end_ts) = if hours <= 0 {
+        let min_ts: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(timestamp) FROM token_usage WHERE duration_ms > 0 AND output_tokens > 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(None);
+        let start = min_ts.unwrap_or(now - 86400);
+        let valid_start = if start >= now { now - 3600 } else { start };
+        (valid_start, now)
+    } else {
+        (now - (hours * 3600), now)
+    };
+
+    let num_buckets = buckets.unwrap_or(8).clamp(2, 60) as usize;
+    let total_span = (end_ts - start_ts).max(1) as f64;
+    let bucket_span = total_span / (num_buckets as f64);
+
+    let model_expr = model_column_expr(view_mode);
+    let sql = format!(
+        "SELECT timestamp, {col} as agg_model, output_tokens, duration_ms, ttft_ms
+         FROM token_usage
+         WHERE timestamp >= ?1 AND timestamp <= ?2 AND duration_ms IS NOT NULL AND duration_ms > 0 AND output_tokens > 0
+         ORDER BY timestamp ASC",
+        col = model_expr
+    );
+
+    struct RawSpeedSample {
+        timestamp: i64,
+        model: String,
+        output_tokens: u64,
+        duration_ms: f64,
+        ttft_ms: Option<f64>,
+        tps: f64,
+    }
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![start_ts, end_ts], |row| {
+            let ts: i64 = row.get(0)?;
+            let model: String = row.get(1)?;
+            let output: u64 = row.get(2)?;
+            let dur: f64 = row.get(3)?;
+            let ttft: Option<f64> = row.get(4)?;
+            let tps = if dur > 0.0 {
+                (output as f64) / (dur / 1000.0)
+            } else {
+                0.0
+            };
+            Ok(RawSpeedSample {
+                timestamp: ts,
+                model,
+                output_tokens: output,
+                duration_ms: dur,
+                ttft_ms: ttft,
+                tps,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut samples: Vec<RawSpeedSample> = Vec::new();
+    for r in rows {
+        samples.push(r.map_err(|e| e.to_string())?);
+    }
+
+    // Mid timestamp for dumbbell comparison (first half vs second half)
+    let mid_ts = start_ts + (end_ts - start_ts) / 2;
+
+    // Per-model grouping
+    struct ModelAccumulator {
+        sample_count: u64,
+        total_output_tokens: u64,
+        sum_tps: f64,
+        sum_duration_sec: f64,
+        min_tps: f64,
+        max_tps: f64,
+        ttft_samples: Vec<f64>,
+        first_half_tps_sum: f64,
+        first_half_count: u64,
+        second_half_tps_sum: f64,
+        second_half_count: u64,
+    }
+
+    let mut model_acc: std::collections::HashMap<String, ModelAccumulator> =
+        std::collections::HashMap::new();
+
+    // Global summary aggregators
+    let mut global_total_samples = 0u64;
+    let mut global_total_output_tokens = 0u64;
+    let mut global_sum_tps = 0.0f64;
+    let mut global_sum_duration_sec = 0.0f64;
+    let mut global_ttft_samples: Vec<f64> = Vec::new();
+
+    // Pre-create time buckets
+    let mut bucket_list: Vec<ModelSpeedBucket> = Vec::with_capacity(num_buckets);
+    for i in 0..num_buckets {
+        let b_start = start_ts + (i as f64 * bucket_span).round() as i64;
+        let b_end = if i == num_buckets - 1 {
+            end_ts
+        } else {
+            start_ts + ((i + 1) as f64 * bucket_span).round() as i64
+        };
+        let label = chrono::DateTime::from_timestamp(b_start, 0)
+            .map(|dt| {
+                dt.with_timezone(&chrono::Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| format!("B{}", i + 1));
+        bucket_list.push(ModelSpeedBucket {
+            label,
+            start_ts: b_start,
+            end_ts: b_end,
+            models: std::collections::HashMap::new(),
+        });
+    }
+
+    // Helper for bucket accumulation: (bucket_idx, model) -> (sum_tps, count, tokens)
+    let mut bucket_accum: std::collections::HashMap<(usize, String), (f64, u64, u64)> =
+        std::collections::HashMap::new();
+
+    for s in &samples {
+        global_total_samples += 1;
+        global_total_output_tokens += s.output_tokens;
+        global_sum_tps += s.tps;
+        global_sum_duration_sec += s.duration_ms / 1000.0;
+        if let Some(t) = s.ttft_ms {
+            if t > 0.0 {
+                global_ttft_samples.push(t);
+            }
+        }
+
+        let acc = model_acc
+            .entry(s.model.clone())
+            .or_insert_with(|| ModelAccumulator {
+                sample_count: 0,
+                total_output_tokens: 0,
+                sum_tps: 0.0,
+                sum_duration_sec: 0.0,
+                min_tps: f64::MAX,
+                max_tps: 0.0,
+                ttft_samples: Vec::new(),
+                first_half_tps_sum: 0.0,
+                first_half_count: 0,
+                second_half_tps_sum: 0.0,
+                second_half_count: 0,
+            });
+
+        acc.sample_count += 1;
+        acc.total_output_tokens += s.output_tokens;
+        acc.sum_tps += s.tps;
+        acc.sum_duration_sec += s.duration_ms / 1000.0;
+        if s.tps < acc.min_tps {
+            acc.min_tps = s.tps;
+        }
+        if s.tps > acc.max_tps {
+            acc.max_tps = s.tps;
+        }
+        if let Some(t) = s.ttft_ms {
+            if t > 0.0 {
+                acc.ttft_samples.push(t);
+            }
+        }
+
+        if s.timestamp < mid_ts {
+            acc.first_half_tps_sum += s.tps;
+            acc.first_half_count += 1;
+        } else {
+            acc.second_half_tps_sum += s.tps;
+            acc.second_half_count += 1;
+        }
+
+        // Assign to bucket
+        let mut b_idx = if bucket_span > 0.0 {
+            ((s.timestamp - start_ts) as f64 / bucket_span).floor() as usize
+        } else {
+            0
+        };
+        if b_idx >= num_buckets {
+            b_idx = num_buckets - 1;
+        }
+        let b_entry = bucket_accum
+            .entry((b_idx, s.model.clone()))
+            .or_insert((0.0, 0, 0));
+        b_entry.0 += s.tps;
+        b_entry.1 += 1;
+        b_entry.2 += s.output_tokens;
+    }
+
+    // Populate buckets
+    for ((b_idx, model), (sum_tps, count, tokens)) in bucket_accum {
+        if b_idx < bucket_list.len() && count > 0 {
+            let avg = (sum_tps / count as f64 * 100.0).round() / 100.0;
+            bucket_list[b_idx].models.insert(
+                model,
+                ModelSpeedBucketPoint {
+                    avg_tps: avg,
+                    sample_count: count,
+                    total_output_tokens: tokens,
+                },
+            );
+        }
+    }
+
+    let mut model_items: Vec<ModelSpeedItem> = Vec::new();
+    for (model, mut acc) in model_acc {
+        let avg_tps = if acc.sample_count > 0 {
+            (acc.sum_tps / acc.sample_count as f64 * 100.0).round() / 100.0
+        } else {
+            0.0
+        };
+        let weighted_tps = if acc.sum_duration_sec > 0.0 {
+            (acc.total_output_tokens as f64 / acc.sum_duration_sec * 100.0).round() / 100.0
+        } else {
+            0.0
+        };
+        let min_tps = if acc.min_tps == f64::MAX {
+            0.0
+        } else {
+            (acc.min_tps * 100.0).round() / 100.0
+        };
+        let max_tps = (acc.max_tps * 100.0).round() / 100.0;
+
+        let avg_ttft_ms = if !acc.ttft_samples.is_empty() {
+            let sum: f64 = acc.ttft_samples.iter().sum();
+            Some((sum / acc.ttft_samples.len() as f64 * 10.0).round() / 10.0)
+        } else {
+            None
+        };
+
+        let p95_ttft_ms = if !acc.ttft_samples.is_empty() {
+            acc.ttft_samples
+                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let rank = (acc.ttft_samples.len() as f64 * 0.95).ceil() as usize;
+            let idx = (rank.saturating_sub(1)).min(acc.ttft_samples.len() - 1);
+            Some((acc.ttft_samples[idx] * 10.0).round() / 10.0)
+        } else {
+            None
+        };
+
+        let first_half_tps = if acc.first_half_count > 0 {
+            Some((acc.first_half_tps_sum / acc.first_half_count as f64 * 100.0).round() / 100.0)
+        } else {
+            None
+        };
+
+        let second_half_tps = if acc.second_half_count > 0 {
+            Some((acc.second_half_tps_sum / acc.second_half_count as f64 * 100.0).round() / 100.0)
+        } else {
+            None
+        };
+
+        let tps_delta = match (first_half_tps, second_half_tps) {
+            (Some(f), Some(s)) => Some(((s - f) * 100.0).round() / 100.0),
+            _ => None,
+        };
+
+        model_items.push(ModelSpeedItem {
+            model,
+            sample_count: acc.sample_count,
+            total_output_tokens: acc.total_output_tokens,
+            avg_tps,
+            weighted_tps,
+            min_tps,
+            max_tps,
+            avg_ttft_ms,
+            p95_ttft_ms,
+            first_half_tps,
+            second_half_tps,
+            tps_delta,
+        });
+    }
+
+    // Sort models by sample_count DESC, then total_output_tokens DESC
+    model_items.sort_by(|a, b| {
+        b.sample_count
+            .cmp(&a.sample_count)
+            .then_with(|| b.total_output_tokens.cmp(&a.total_output_tokens))
+    });
+
+    let global_avg_tps = if global_total_samples > 0 {
+        Some((global_sum_tps / global_total_samples as f64 * 100.0).round() / 100.0)
+    } else {
+        None
+    };
+
+    let global_weighted_tps = if global_sum_duration_sec > 0.0 {
+        Some((global_total_output_tokens as f64 / global_sum_duration_sec * 100.0).round() / 100.0)
+    } else {
+        None
+    };
+
+    let global_avg_ttft = if !global_ttft_samples.is_empty() {
+        let sum: f64 = global_ttft_samples.iter().sum();
+        Some((sum / global_ttft_samples.len() as f64 * 10.0).round() / 10.0)
+    } else {
+        None
+    };
+
+    let global_p95_ttft = if !global_ttft_samples.is_empty() {
+        global_ttft_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let rank = (global_ttft_samples.len() as f64 * 0.95).ceil() as usize;
+        let idx = (rank.saturating_sub(1)).min(global_ttft_samples.len() - 1);
+        Some((global_ttft_samples[idx] * 10.0).round() / 10.0)
+    } else {
+        None
+    };
+
+    let summary = ModelSpeedGlobalSummary {
+        total_samples: global_total_samples,
+        total_output_tokens: global_total_output_tokens,
+        avg_tps: global_avg_tps,
+        weighted_tps: global_weighted_tps,
+        avg_ttft_ms: global_avg_ttft,
+        p95_ttft_ms: global_p95_ttft,
+    };
+
+    Ok(ModelSpeedResponse {
+        summary,
+        models: model_items,
+        buckets: bucket_list,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,7 +1428,7 @@ mod tests {
                 .to_rfc3339()
         };
         serde_json::from_value(serde_json::json!({
-            "models": [], "last_updated": observed,
+            "models": [{"name": "claude-3-7-sonnet", "percentage": 100, "reset_time": "2026-11-08T00:00:00Z"}], "last_updated": observed,
             "quota_groups": [
                 {"display_name": "Gemini Models", "buckets": [
                     {"bucket_id": "gemini-weekly", "window": "weekly", "remaining_fraction": fraction,
@@ -1213,5 +1629,67 @@ mod tests {
 
         assert_eq!(m_migrated, "gemini-3.8-flash-low");
         assert_eq!(req_migrated.as_deref(), Some("claude-haiku-4-5-20251001"));
+    }
+
+    #[test]
+    fn test_model_speed_stats_calculation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                account_email TEXT NOT NULL,
+                model TEXT NOT NULL,
+                requested_model TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                ttft_ms REAL,
+                duration_ms REAL
+            );",
+        )
+        .unwrap();
+
+        let base_ts = 1_700_000_000;
+        // Model A: sample 1: 100 tokens in 2000ms = 50 tps, ttft 200
+        // Model A: sample 2: 200 tokens in 2000ms = 100 tps, ttft 400
+        // Model B: sample 1: 300 tokens in 10000ms = 30 tps, ttft 600
+        conn.execute(
+            "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, ttft_ms, duration_ms)
+             VALUES (?1, 'test@a.com', 'model-a', 'alias-a', 50, 100, 0, 0, 150, 200.0, 2000.0)",
+            params![base_ts + 100],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, ttft_ms, duration_ms)
+             VALUES (?1, 'test@a.com', 'model-a', 'alias-a', 50, 200, 0, 0, 250, 400.0, 2000.0)",
+            params![base_ts + 500],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO token_usage (timestamp, account_email, model, requested_model, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, ttft_ms, duration_ms)
+             VALUES (?1, 'test@b.com', 'model-b', 'alias-b', 50, 300, 0, 0, 350, 600.0, 10000.0)",
+            params![base_ts + 800],
+        ).unwrap();
+
+        let res = get_model_speed_stats_with_conn(&conn, 0, Some(4), None).unwrap();
+        assert_eq!(res.summary.total_samples, 3);
+        assert_eq!(res.summary.total_output_tokens, 600);
+        // sample-mean tps: (50 + 100 + 30) / 3 = 60.0
+        assert_eq!(res.summary.avg_tps, Some(60.0));
+        // weighted tps: 600 / (2.0 + 2.0 + 10.0) = 600 / 14 = 42.86
+        assert_eq!(res.summary.weighted_tps, Some(42.86));
+
+        assert_eq!(res.models.len(), 2);
+        let model_a = res.models.iter().find(|m| m.model == "model-a").unwrap();
+        assert_eq!(model_a.sample_count, 2);
+        assert_eq!(model_a.total_output_tokens, 300);
+        assert_eq!(model_a.avg_tps, 75.0); // (50 + 100) / 2
+        assert_eq!(model_a.weighted_tps, 75.0); // 300 / 4s = 75
+        assert_eq!(model_a.min_tps, 50.0);
+        assert_eq!(model_a.max_tps, 100.0);
+        assert_eq!(model_a.avg_ttft_ms, Some(300.0));
     }
 }

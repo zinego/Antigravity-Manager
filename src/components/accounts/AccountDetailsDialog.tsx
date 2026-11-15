@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
-import { X, Clock, AlertCircle, Bot } from 'lucide-react';
+import { X, Clock, AlertCircle, Bot, Coins, ExternalLink, RotateCcw } from 'lucide-react';
 import { createPortal } from 'react-dom';
-import { Account, getAccountTier, getTierLabel } from '../../types/account';
+import { Account, getAccountTier, getTierLabel, isVertexAccount, VertexAccountInfo, VertexCreditConfig } from '../../types/account';
+import { updateVertexCredit } from '../../services/accountService';
+import { useAccountStore } from '../../stores/useAccountStore';
+import { formatCurrencyAmount } from '../../utils/quotaDisplay';
 import { formatDate, formatTimeRemaining } from '../../utils/format';
 import { useTranslation } from 'react-i18next';
 import { MODEL_CONFIG, sortModels } from '../../config/modelConfig';
@@ -29,6 +32,46 @@ export default function AccountDetailsDialog({
     const [projectIdInput, setProjectIdInput] = useState('');
     const [savingProjectId, setSavingProjectId] = useState(false);
     const [fetchingProjectId, setFetchingProjectId] = useState(false);
+
+    // Vertex credit tracking state
+    const isVertex = useMemo(() => isVertexAccount(account), [account]);
+    const vertexInfo: VertexAccountInfo | undefined = useMemo(() => {
+        if (!account || !isVertex) return undefined;
+        if (account.vertex_info) return account.vertex_info;
+        const sa = account.token?.service_account;
+        const cred = account.token?.vertex_credit;
+        const initial = cred?.initial_credit ?? 300.0;
+        const spent = cred?.external_spent ?? 0.0;
+        return {
+            project_id: account.token?.project_id || sa?.project_id || "",
+            location: account.token?.vertex_location || "global",
+            client_email: sa?.client_email || account.email,
+            billing_account_id: cred?.billing_account_id,
+            credit_configured: Boolean(cred),
+            initial_credit: initial,
+            currency: cred?.currency || "USD",
+            external_spent: spent,
+            exchange_rate: cred?.exchange_rate ?? 1.0,
+            local_estimated_spent_usd: 0.0,
+            total_spent: spent,
+            remaining_credit: Math.max(0, initial - spent),
+            baseline_timestamp: cred?.baseline_timestamp,
+            expires_at: cred?.expires_at,
+            total_requests: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cached_tokens: 0,
+        };
+    }, [account, isVertex]);
+
+    const [creditCurrency, setCreditCurrency] = useState('USD');
+    const [initialCreditInput, setInitialCreditInput] = useState('300');
+    const [exchangeRateInput, setExchangeRateInput] = useState('1');
+    const [externalSpentInput, setExternalSpentInput] = useState('0');
+    const [billingAccountIdInput, setBillingAccountIdInput] = useState('');
+    const [expiresAtInput, setExpiresAtInput] = useState('');
+    const [baselineTs, setBaselineTs] = useState<number | null>(null);
+    const [savingCredit, setSavingCredit] = useState(false);
 
     const displayGroups = useMemo(() => {
         return account?.quota?.quota_groups || [];
@@ -61,6 +104,33 @@ export default function AccountDetailsDialog({
     useEffect(() => {
         setPriorityInput(String(account?.priority ?? 50));
         setProjectIdInput(account?.token?.project_id || '');
+        if (account?.token?.vertex_credit) {
+            const vc = account.token.vertex_credit;
+            setCreditCurrency(vc.currency || 'USD');
+            setInitialCreditInput(String(vc.initial_credit ?? 300));
+            setExchangeRateInput(String(vc.exchange_rate ?? 1.0));
+            setExternalSpentInput(String(vc.external_spent ?? 0));
+            setBillingAccountIdInput(vc.billing_account_id || '');
+            setExpiresAtInput(vc.expires_at || '');
+            setBaselineTs(vc.baseline_timestamp ?? null);
+        } else if (account?.vertex_info) {
+            const vi = account.vertex_info;
+            setCreditCurrency(vi.currency || 'USD');
+            setInitialCreditInput(String(vi.initial_credit ?? 300));
+            setExchangeRateInput(String(vi.exchange_rate ?? 1.0));
+            setExternalSpentInput(String(vi.external_spent ?? 0));
+            setBillingAccountIdInput(vi.billing_account_id || '');
+            setExpiresAtInput(vi.expires_at || '');
+            setBaselineTs(vi.baseline_timestamp ?? null);
+        } else {
+            setCreditCurrency('USD');
+            setInitialCreditInput('300');
+            setExchangeRateInput('1');
+            setExternalSpentInput('0');
+            setBillingAccountIdInput('');
+            setExpiresAtInput('');
+            setBaselineTs(null);
+        }
     }, [account?.id, account?.priority, account?.token?.project_id]);
 
     if (!account) return null;
@@ -117,6 +187,60 @@ export default function AccountDetailsDialog({
             setFetchingProjectId(false);
         }
     };
+
+    const handleCurrencyChange = (newCurr: string) => {
+        setCreditCurrency(newCurr);
+        if (newCurr === 'JPY') {
+            if (exchangeRateInput === '1' || exchangeRateInput === '1.0' || exchangeRateInput === '') {
+                setExchangeRateInput('155.0');
+            }
+            if (initialCreditInput === '300' || initialCreditInput === '300.0') {
+                setInitialCreditInput('45000');
+            }
+        } else if (newCurr === 'USD') {
+            if (exchangeRateInput === '155' || exchangeRateInput === '155.0') {
+                setExchangeRateInput('1.0');
+            }
+            if (initialCreditInput === '45000') {
+                setInitialCreditInput('300');
+            }
+        }
+    };
+
+    const handleResetBaseline = () => {
+        const now = Math.floor(Date.now() / 1000);
+        setBaselineTs(now);
+        showToast(t('accounts.vertex.baseline_reset', { defaultValue: '已设置校准基线为当前时间，将只统计此后的本地 Token 消耗' }), 'info');
+    };
+
+    const handleClearBaseline = () => {
+        setBaselineTs(null);
+        showToast(t('accounts.vertex.baseline_cleared', { defaultValue: '已清除基线时间戳，将统计全部历史消耗' }), 'info');
+    };
+
+    const saveVertexCredit = async () => {
+        if (!account) return;
+        setSavingCredit(true);
+        try {
+            const config: VertexCreditConfig = {
+                initial_credit: Number(initialCreditInput) || 0,
+                currency: creditCurrency.trim() || 'USD',
+                external_spent: Number(externalSpentInput) || 0,
+                exchange_rate: Number(exchangeRateInput) || 1.0,
+                baseline_timestamp: baselineTs,
+                billing_account_id: billingAccountIdInput.trim() || null,
+                expires_at: expiresAtInput.trim() || null,
+            };
+            await updateVertexCredit(account.id, config);
+            showToast(t('accounts.vertex.credit_updated', { defaultValue: 'Vertex 赠金配置已保存' }), 'success');
+            await useAccountStore.getState().fetchAccounts();
+        } catch (error) {
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        } finally {
+            setSavingCredit(false);
+        }
+    };
+
 
     return createPortal(
         <div className="modal modal-open z-[100]">
@@ -262,6 +386,215 @@ export default function AccountDetailsDialog({
                             </button>
                         </div>
                     </div>
+
+                    {/* Vertex AI & Google Cloud 赠金余额跟踪板块 */}
+                    {isVertex && (
+                        <div className="p-4 rounded-xl border border-emerald-200/80 dark:border-emerald-800/60 bg-gradient-to-br from-emerald-50/50 via-teal-50/20 to-sky-50/20 dark:from-emerald-950/20 dark:via-base-200/50 dark:to-teal-950/20 flex flex-col gap-4 shadow-sm">
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-emerald-100 dark:border-emerald-900/40 pb-3">
+                                <div>
+                                    <div className="text-sm font-bold text-gray-900 dark:text-gray-100 flex items-center gap-2">
+                                        <Coins className="w-4 h-4 text-emerald-500" />
+                                        <span>{t('accounts.vertex.section_title', { defaultValue: 'Vertex AI · Google Cloud 赠金与账户管理' })}</span>
+                                        <span className="px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-300 font-mono text-[10px] font-bold">
+                                            {vertexInfo?.location || 'global'}
+                                        </span>
+                                    </div>
+                                    <div className="mt-1 flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400 font-mono">
+                                        <span>{t('accounts.vertex.sa_email', { defaultValue: '服务账号' })}:</span>
+                                        <span className="font-semibold text-gray-700 dark:text-gray-300 truncate max-w-xs" title={vertexInfo?.client_email}>
+                                            {vertexInfo?.client_email}
+                                        </span>
+                                    </div>
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
+                                    <a
+                                        href={billingAccountIdInput.trim() ? `https://console.cloud.google.com/billing/${billingAccountIdInput.trim()}` : 'https://console.cloud.google.com/billing'}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="btn btn-outline btn-xs gap-1 border-emerald-300 text-emerald-700 hover:bg-emerald-600 hover:text-white dark:border-emerald-700 dark:text-emerald-300"
+                                        title={t('accounts.vertex.open_billing_hint', { defaultValue: '在浏览器打开 Google Cloud Console 结算台核对最新官方账单与赠金余额' })}
+                                    >
+                                        <ExternalLink className="w-3 h-3" />
+                                        <span>{t('accounts.vertex.open_billing_console', { defaultValue: '打开 GCP 结算台核对余额' })}</span>
+                                    </a>
+                                </div>
+                            </div>
+
+                            {/* 运行消费实时统计摘要卡片 */}
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                                <div className="p-2.5 rounded-lg bg-white/80 dark:bg-base-200/60 border border-emerald-100 dark:border-white/5 flex flex-col">
+                                    <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono uppercase tracking-wider">{t('accounts.vertex.stat_remaining', { defaultValue: '剩余赠金余额' })}</span>
+                                    <span className="text-sm font-bold font-mono text-emerald-600 dark:text-emerald-400 mt-0.5">
+                                        {formatCurrencyAmount(vertexInfo?.remaining_credit ?? 300, creditCurrency)}
+                                    </span>
+                                </div>
+                                <div className="p-2.5 rounded-lg bg-white/80 dark:bg-base-200/60 border border-emerald-100 dark:border-white/5 flex flex-col">
+                                    <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono uppercase tracking-wider">{t('accounts.vertex.stat_total_spent', { defaultValue: '累计已消耗' })}</span>
+                                    <span className="text-sm font-bold font-mono text-gray-800 dark:text-gray-200 mt-0.5">
+                                        {formatCurrencyAmount(vertexInfo?.total_spent ?? 0, creditCurrency)}
+                                    </span>
+                                </div>
+                                <div className="p-2.5 rounded-lg bg-white/80 dark:bg-base-200/60 border border-emerald-100 dark:border-white/5 flex flex-col">
+                                    <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono uppercase tracking-wider">{t('accounts.vertex.stat_local_est', { defaultValue: '本地调用估算 (USD)' })}</span>
+                                    <span className="text-sm font-bold font-mono text-blue-600 dark:text-blue-400 mt-0.5">
+                                        ${(vertexInfo?.local_estimated_spent_usd ?? 0).toFixed(4)}
+                                    </span>
+                                </div>
+                                <div className="p-2.5 rounded-lg bg-white/80 dark:bg-base-200/60 border border-emerald-100 dark:border-white/5 flex flex-col">
+                                    <span className="text-[10px] text-gray-400 dark:text-gray-500 font-mono uppercase tracking-wider">{t('accounts.vertex.stat_requests', { defaultValue: '请求 / Token 统计' })}</span>
+                                    <span className="text-xs font-mono font-medium text-gray-700 dark:text-gray-300 mt-1 truncate" title={`In: ${vertexInfo?.total_input_tokens || 0}, Out: ${vertexInfo?.total_output_tokens || 0}, Cache: ${vertexInfo?.total_cached_tokens || 0}`}>
+                                        {vertexInfo?.total_requests || 0} req / {(((vertexInfo?.total_input_tokens || 0) + (vertexInfo?.total_output_tokens || 0)) / 1000).toFixed(1)}k tok
+                                    </span>
+                                </div>
+                            </div>
+
+                            {/* 赠金余额与基线校准表单 */}
+                            <div className="p-3 rounded-lg bg-white/90 dark:bg-base-200/80 border border-gray-100 dark:border-base-300/60 flex flex-col gap-3">
+                                <div className="text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider flex items-center justify-between">
+                                    <span>{t('accounts.vertex.config_form_title', { defaultValue: 'Google Cloud 赠金参数校准' })}</span>
+                                    <span className="text-[10px] font-normal text-gray-400">
+                                        {t('accounts.vertex.config_form_hint', { defaultValue: '可依据 GCP 结算台控制台对账单进行校准' })}
+                                    </span>
+                                </div>
+
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                    <div className="flex flex-col gap-1">
+                                        <label className="text-[11px] font-medium text-gray-600 dark:text-gray-400">
+                                            {t('accounts.vertex.currency', { defaultValue: '结算货币 (Currency)' })}
+                                        </label>
+                                        <select
+                                            className="select select-bordered select-sm text-xs font-mono"
+                                            value={creditCurrency}
+                                            onChange={(e) => handleCurrencyChange(e.target.value)}
+                                            disabled={savingCredit}
+                                        >
+                                            <option value="USD">USD ($)</option>
+                                            <option value="JPY">JPY (¥)</option>
+                                            <option value="EUR">EUR (€)</option>
+                                            <option value="CNY">CNY (¥)</option>
+                                        </select>
+                                    </div>
+
+                                    <div className="flex flex-col gap-1">
+                                        <label className="text-[11px] font-medium text-gray-600 dark:text-gray-400">
+                                            {t('accounts.vertex.initial_credit', { defaultValue: '初始赠金总额' })}
+                                        </label>
+                                        <input
+                                            type="number"
+                                            step="any"
+                                            className="input input-bordered input-sm text-xs font-mono"
+                                            value={initialCreditInput}
+                                            onChange={(e) => setInitialCreditInput(e.target.value)}
+                                            disabled={savingCredit}
+                                            placeholder="300"
+                                        />
+                                    </div>
+
+                                    <div className="flex flex-col gap-1">
+                                        <label className="text-[11px] font-medium text-gray-600 dark:text-gray-400">
+                                            {t('accounts.vertex.exchange_rate', { defaultValue: 'USD 汇率 (Exchange Rate)' })}
+                                        </label>
+                                        <input
+                                            type="number"
+                                            step="any"
+                                            className="input input-bordered input-sm text-xs font-mono"
+                                            value={exchangeRateInput}
+                                            onChange={(e) => setExchangeRateInput(e.target.value)}
+                                            disabled={savingCredit}
+                                            placeholder="1.0"
+                                            title="1 USD 对应多少当前货币 (USD填1，JPY通常为150~155)"
+                                        />
+                                    </div>
+
+                                    <div className="flex flex-col gap-1">
+                                        <label className="text-[11px] font-medium text-gray-600 dark:text-gray-400">
+                                            {t('accounts.vertex.external_spent', { defaultValue: '历史/外部已消耗金额' })}
+                                        </label>
+                                        <input
+                                            type="number"
+                                            step="any"
+                                            className="input input-bordered input-sm text-xs font-mono"
+                                            value={externalSpentInput}
+                                            onChange={(e) => setExternalSpentInput(e.target.value)}
+                                            disabled={savingCredit}
+                                            placeholder="0.00"
+                                            title="在控制台已发生的历史费用，或重新校准时的底线偏移"
+                                        />
+                                    </div>
+
+                                    <div className="flex flex-col gap-1">
+                                        <label className="text-[11px] font-medium text-gray-600 dark:text-gray-400">
+                                            {t('accounts.vertex.billing_account_id', { defaultValue: '结算账号 ID (可选)' })}
+                                        </label>
+                                        <input
+                                            type="text"
+                                            className="input input-bordered input-sm text-xs font-mono"
+                                            value={billingAccountIdInput}
+                                            onChange={(e) => setBillingAccountIdInput(e.target.value)}
+                                            disabled={savingCredit}
+                                            placeholder="012FA9-D7D39F-27BD53"
+                                        />
+                                    </div>
+
+                                    <div className="flex flex-col gap-1">
+                                        <label className="text-[11px] font-medium text-gray-600 dark:text-gray-400">
+                                            {t('accounts.vertex.expires_at', { defaultValue: '赠金截止日期 (可选)' })}
+                                        </label>
+                                        <input
+                                            type="text"
+                                            className="input input-bordered input-sm text-xs font-mono"
+                                            value={expiresAtInput}
+                                            onChange={(e) => setExpiresAtInput(e.target.value)}
+                                            disabled={savingCredit}
+                                            placeholder="YYYY-MM-DD"
+                                        />
+                                    </div>
+                                </div>
+
+                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-2 border-t border-gray-100 dark:border-base-300">
+                                    <div className="flex items-center gap-2 text-[11px] text-gray-500 font-mono">
+                                        <span>{t('accounts.vertex.baseline_label', { defaultValue: '基线时间' })}:</span>
+                                        {baselineTs ? (
+                                            <span className="text-emerald-600 dark:text-emerald-400 font-bold">
+                                                {new Date(baselineTs * 1000).toLocaleString()}
+                                            </span>
+                                        ) : (
+                                            <span className="text-gray-400">{t('accounts.vertex.baseline_all', { defaultValue: '统计全部历史记录' })}</span>
+                                        )}
+                                        {baselineTs ? (
+                                            <button
+                                                type="button"
+                                                onClick={handleClearBaseline}
+                                                className="text-xs text-red-500 hover:underline ml-1"
+                                                disabled={savingCredit}
+                                            >
+                                                {t('common.clear', { defaultValue: '清除' })}
+                                            </button>
+                                        ) : (
+                                            <button
+                                                type="button"
+                                                onClick={handleResetBaseline}
+                                                className="text-xs text-blue-600 dark:text-blue-400 hover:underline ml-1 flex items-center gap-0.5"
+                                                disabled={savingCredit}
+                                            >
+                                                <RotateCcw className="w-2.5 h-2.5" />
+                                                <span>{t('accounts.vertex.set_baseline_now', { defaultValue: '从当前时间重新校准' })}</span>
+                                            </button>
+                                        )}
+                                    </div>
+
+                                    <button
+                                        type="button"
+                                        className="btn btn-primary btn-sm px-4"
+                                        onClick={saveVertexCredit}
+                                        disabled={savingCredit}
+                                    >
+                                        {savingCredit ? t('common.saving') : t('common.save')}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
 
                     {/* Protected Models Section */}
                     {account.protected_models && account.protected_models.length > 0 && (

@@ -1,3 +1,34 @@
+export interface VertexCreditConfig {
+    initial_credit: number;
+    currency: string;
+    external_spent: number;
+    exchange_rate?: number;
+    baseline_timestamp?: number | null;
+    billing_account_id?: string | null;
+    expires_at?: string | null;
+}
+
+export interface VertexAccountInfo {
+    project_id: string;
+    location: string;
+    client_email: string;
+    billing_account_id?: string | null;
+    credit_configured: boolean;
+    initial_credit: number;
+    currency: string;
+    external_spent: number;
+    exchange_rate: number;
+    local_estimated_spent_usd: number;
+    total_spent: number;
+    remaining_credit: number;
+    baseline_timestamp?: number | null;
+    expires_at?: string | null;
+    total_requests: number;
+    total_input_tokens: number;
+    total_output_tokens: number;
+    total_cached_tokens: number;
+}
+
 export interface Account {
     id: string;
     email: string;
@@ -24,6 +55,7 @@ export interface Account {
     validation_url?: string;
     created_at: number;
     last_used: number;
+    vertex_info?: VertexAccountInfo;
 }
 
 export interface ActiveClientsStatus {
@@ -54,6 +86,13 @@ export interface TokenData {
     project_id?: string;
     is_gcp_tos?: boolean;
     oauth_client_key?: string;
+    service_account?: {
+        project_id: string;
+        client_email: string;
+        token_uri?: string;
+    };
+    vertex_location?: string;
+    vertex_credit?: VertexCreditConfig;
 }
 
 export interface QuotaData {
@@ -236,4 +275,16 @@ export interface BatchImportResult {
     success: number;
     failed: number;
     errors: string[];
+}
+
+
+export function isVertexAccount(account?: {
+    vertex_info?: VertexAccountInfo;
+    token?: { oauth_client_key?: string; service_account?: any };
+} | null): boolean {
+    if (!account) return false;
+    if (account.vertex_info) return true;
+    const clientKey = account.token?.oauth_client_key?.trim().toLowerCase();
+    if (clientKey === "vertex_service_account" || clientKey?.includes("vertex")) return true;
+    return Boolean(account.token?.service_account);
 }

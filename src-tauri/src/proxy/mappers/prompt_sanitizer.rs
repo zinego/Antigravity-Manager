@@ -990,10 +990,97 @@ impl PromptSanitizer {
             }
         }
 
+        // 3.5. 执行提示词改写（严格匹配并替换，若启用，必须在零宽脱敏之前执行）
+        Self::apply_prompt_rewrite(body);
+
         // 4. 执行零宽字符敏感词脱敏（若启用）
         Self::apply_sensitive_word_obfuscation(body);
 
         cleaned_count
+    }
+
+    /// 提示词改写处理（全局配置入口）：
+    /// 自动读取静态单例配置与预编译 Rewriter。
+    fn apply_prompt_rewrite(body: &mut Value) {
+        let Some(rewriter) = crate::proxy::config::get_prompt_rewriter() else {
+            return;
+        };
+        let cfg = crate::proxy::config::get_prompt_rewrite_config();
+        if !cfg.enabled {
+            return;
+        }
+        Self::apply_prompt_rewrite_with_rewriter(body, cfg.scope, &rewriter);
+    }
+
+    /// 提示词改写处理（显式配置与 Rewriter 入口）：
+    /// 供单元测试或内部流水线直接调用，免除静态全局状态污染。
+    /// 严格捍卫：
+    /// 1. 思考块受 thoughtSignature 保护，绝对不可变；
+    /// 2. tools、functionCall、functionResponse、inlineData 绝不触碰；
+    /// 3. system_instruction 模式：仅改写 systemInstruction / system_instruction 中的文本；
+    /// 4. system_and_messages 模式：同时改写 contents 中的文本，并在 contents 提问中保护围栏代码块。
+    pub fn apply_prompt_rewrite_with_rewriter(
+        body: &mut Value,
+        scope: crate::proxy::config::PromptRewriteScope,
+        rewriter: &crate::proxy::mappers::prompt_rewrite::PromptRewriter,
+    ) {
+        // 1. 改写 systemInstruction 或 system_instruction
+        for sys_key in ["systemInstruction", "system_instruction"] {
+            if let Some(sys) = body.get_mut(sys_key) {
+                if let Some(parts) = sys.get_mut("parts").and_then(Value::as_array_mut) {
+                    for part in parts.iter_mut() {
+                        if let Some(obj) = part.as_object_mut() {
+                            let is_thought =
+                                obj.get("thought").and_then(Value::as_bool).unwrap_or(false)
+                                    || obj.contains_key("thoughtSignature")
+                                    || obj.contains_key("thought_signature");
+                            if is_thought {
+                                continue;
+                            }
+                            if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                                let (rewritten, modified) = rewriter.apply_to_text(text);
+                                if modified {
+                                    obj.insert("text".to_string(), Value::String(rewritten));
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(sys_str) = sys.as_str() {
+                    let (rewritten, modified) = rewriter.apply_to_text(sys_str);
+                    if modified {
+                        *sys = Value::String(rewritten);
+                    }
+                }
+            }
+        }
+
+        // 2. 若作用域包含 messages，改写 contents 中的文本部分（保护围栏代码块）
+        if scope == crate::proxy::config::PromptRewriteScope::SystemAndMessages {
+            if let Some(contents) = body.get_mut("contents").and_then(Value::as_array_mut) {
+                for turn in contents.iter_mut() {
+                    if let Some(parts) = turn.get_mut("parts").and_then(Value::as_array_mut) {
+                        for part in parts.iter_mut() {
+                            if let Some(obj) = part.as_object_mut() {
+                                let is_thought =
+                                    obj.get("thought").and_then(Value::as_bool).unwrap_or(false)
+                                        || obj.contains_key("thoughtSignature")
+                                        || obj.contains_key("thought_signature");
+                                if is_thought {
+                                    continue;
+                                }
+                                if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                                    let (rewritten, modified) =
+                                        rewriter.apply_to_text_protecting_fenced_code(text);
+                                    if modified {
+                                        obj.insert("text".to_string(), Value::String(rewritten));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 敏感词零宽字符脱敏处理（全局配置入口）：
@@ -2598,5 +2685,195 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(sys_text.contains("_\u{200B}_OBFUSCATE_GLOBAL_E2E_WORD__"));
+    }
+
+    #[test]
+    fn test_prompt_rewrite_system_instruction_scope() {
+        use crate::proxy::config::PromptRewriteRule;
+        use crate::proxy::mappers::prompt_rewrite::PromptRewriter;
+
+        let rewriter = PromptRewriter::from_rules(&[PromptRewriteRule {
+            enabled: true,
+            r#match: "old_agent".to_string(),
+            replace: "new_agent".to_string(),
+        }])
+        .expect("rewriter should build");
+
+        let mut payload = json!({
+            "systemInstruction": {
+                "parts": [
+                    { "text": "You are old_agent for code." }
+                ]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "text": "Call old_agent now." }
+                    ]
+                }
+            ],
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "old_agent_tool",
+                            "description": "Tool for old_agent."
+                        }
+                    ]
+                }
+            ]
+        });
+
+        PromptSanitizer::apply_prompt_rewrite_with_rewriter(
+            &mut payload,
+            crate::proxy::config::PromptRewriteScope::SystemInstruction,
+            &rewriter,
+        );
+
+        let sys_text = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(sys_text, "You are new_agent for code.");
+
+        // contents and tools in SystemInstruction scope must NOT be modified
+        let user_text = payload["contents"][0]["parts"][0]["text"].as_str().unwrap();
+        assert_eq!(user_text, "Call old_agent now.");
+
+        let tool_desc = payload["tools"][0]["functionDeclarations"][0]["description"]
+            .as_str()
+            .unwrap();
+        assert_eq!(tool_desc, "Tool for old_agent.");
+    }
+
+    #[test]
+    fn test_prompt_rewrite_system_and_messages_scope_protects_code_and_thoughts() {
+        use crate::proxy::config::PromptRewriteRule;
+        use crate::proxy::mappers::prompt_rewrite::PromptRewriter;
+
+        let rewriter = PromptRewriter::from_rules(&[PromptRewriteRule {
+            enabled: true,
+            r#match: "OldModel".to_string(),
+            replace: "NewModel".to_string(),
+        }])
+        .expect("rewriter should build");
+
+        let mut payload = json!({
+            "systemInstruction": {
+                "parts": [
+                    { "text": "System OldModel directive." }
+                ]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": "User OldModel query:\n```python\nmodel = \"OldModel\"\nprint(model)\n```\nAfter code OldModel."
+                        }
+                    ]
+                },
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "thought": true,
+                            "thoughtSignature": "sig_OldModel_123",
+                            "text": "Thought about OldModel."
+                        },
+                        {
+                            "text": "Model OldModel response."
+                        }
+                    ]
+                }
+            ]
+        });
+
+        PromptSanitizer::apply_prompt_rewrite_with_rewriter(
+            &mut payload,
+            crate::proxy::config::PromptRewriteScope::SystemAndMessages,
+            &rewriter,
+        );
+
+        let sys_text = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(sys_text, "System NewModel directive.");
+
+        let user_text = payload["contents"][0]["parts"][0]["text"].as_str().unwrap();
+        assert!(user_text.contains("User NewModel query:"));
+        assert!(user_text.contains("After code NewModel."));
+        // Fenced code block strictly protected
+        assert!(user_text.contains(r#"model = "OldModel""#));
+
+        // Thought block strictly preserved
+        let thought_text = payload["contents"][1]["parts"][0]["text"].as_str().unwrap();
+        assert_eq!(thought_text, "Thought about OldModel.");
+
+        // Model reply outside thought modified
+        let model_text = payload["contents"][1]["parts"][1]["text"].as_str().unwrap();
+        assert_eq!(model_text, "Model NewModel response.");
+    }
+
+    #[test]
+    fn test_prompt_rewrite_runs_before_zero_width_obfuscation() {
+        let _lock = crate::proxy::config::TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                crate::proxy::config::update_prompt_rewrite_config(
+                    crate::proxy::config::PromptRewriteConfig::default(),
+                );
+                crate::proxy::config::update_sensitive_word_obfuscation_config(
+                    crate::proxy::config::SensitiveWordObfuscationConfig::default(),
+                );
+            }
+        }
+        let _guard = ResetGuard;
+
+        // Rule: rewrite "old_prompt" -> "SensitiveBrand"
+        let from_word = "__PROMPT_REWRITE_FROM_WORD__";
+        let to_sensitive = "__REWRITE_TO_SENSITIVE__";
+
+        crate::proxy::config::update_prompt_rewrite_config(
+            crate::proxy::config::PromptRewriteConfig {
+                enabled: true,
+                scope: crate::proxy::config::PromptRewriteScope::SystemInstruction,
+                rules: vec![crate::proxy::config::PromptRewriteRule {
+                    enabled: true,
+                    r#match: from_word.to_string(),
+                    replace: to_sensitive.to_string(),
+                }],
+            },
+        );
+
+        // Obfuscation: cloak "SensitiveBrand"
+        crate::proxy::config::update_sensitive_word_obfuscation_config(
+            crate::proxy::config::SensitiveWordObfuscationConfig {
+                enabled: true,
+                scope: crate::proxy::config::SensitiveWordObfuscationScope::SystemInstruction,
+                sensitive_words: vec![to_sensitive.to_string()],
+            },
+        );
+
+        let mut payload = json!({
+            "systemInstruction": {
+                "parts": [
+                    { "text": format!("Instruction referencing {}", from_word) }
+                ]
+            }
+        });
+
+        PromptSanitizer::sanitize_gemini_payload(&mut payload);
+
+        let sys_text = payload["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        // The from_word was rewritten to to_sensitive, and THEN to_sensitive was obfuscated with U+200B after first char!
+        assert!(!sys_text.contains(from_word));
+        assert!(sys_text.contains("_\u{200B}_REWRITE_TO_SENSITIVE__"));
     }
 }

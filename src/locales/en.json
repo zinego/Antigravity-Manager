@@ -872,6 +872,30 @@
             "placeholder": "Enter sensitive words or phrases, one per line...\nExample:\nproxy\nClaude Code\nAnthropic\nOpenAI",
             "word_count": "{{count}} active sensitive words (>=2 chars)",
             "safe_notice": "Thoughts and signatures are strictly preserved"
+        },
+        "prompt_rewrite": {
+            "title": "Prompt Rewrite",
+            "badge_exact": "Exact Match",
+            "hint": "Performs strict literal substring replacement in prompt text sequentially; supports deletion or instruction redirection",
+            "scope_label": "Rewrite Scope",
+            "scope_system_desc": "Applies to systemInstruction only; messages and code snippets remain untouched",
+            "scope_messages_desc": "Applies to systemInstruction and message turns (fenced code blocks are preserved)",
+            "scope_system_only": "System Prompt Only (Recommended)",
+            "scope_system_and_messages": "System Prompt + Messages",
+            "rules_label": "Rewrite Rules List (Executed in order)",
+            "empty_rules": "No rewrite rules yet. Add your first rule below.",
+            "rule_num": "Rule #{{num}}",
+            "match_label": "Strict Match Text",
+            "match_placeholder": "Enter exact text to match (case-sensitive, literal, no regex)...",
+            "replace_label": "Replace With",
+            "replace_placeholder": "Enter replacement text (leave empty to delete matching text)...",
+            "add_rule": "Add Rewrite Rule",
+            "add_rule_title": "Create New Rewrite Rule",
+            "rule_count": "{{count}} / {{total}} rules active",
+            "safe_notice": "Thoughts and signatures are strictly preserved; fenced code blocks are protected in messages scope",
+            "delete_rule": "Delete Rule",
+            "move_up": "Move Up",
+            "move_down": "Move Down"
         }
     },
     "tray": {
@@ -1880,7 +1904,8 @@
             "out_tokens_title": "Output Tokens",
             "ttft_prefix": "TTFT:",
             "total_duration_title": "Total Latency",
-            "ttft_title": "Time to First Token"
+            "ttft_title": "Time to First Token",
+            "tps_title": "Output Speed"
         },
         "details": {
             "title": "Request Details",
@@ -2233,7 +2258,31 @@
         "cockpit_tab_users": "Users",
         "avg_ttft": "TTFT",
         "ttft": "TTFT",
-        "avg_ttft_tip": "Average Time To First Token"
+        "avg_ttft_tip": "Average Time To First Token",
+        "avg_output_tps": "Output Speed",
+        "avg_tps_tip": "Global average token output speed",
+        "speed": {
+            "title": "Token Output Speed Dashboard",
+            "subtitle": "Calculates generation rate and first-token response based on request latency and output tokens",
+            "mode_trend": "Trend",
+            "mode_trend_tip": "Multi-bucket trend chart (Lollipop / Curve)",
+            "mode_dumbbell": "Half-Window",
+            "mode_dumbbell_tip": "First vs. second half window speed comparison (Dumbbell)",
+            "kpi_weighted_tps": "Weighted Speed",
+            "kpi_sample_mean_tps": "Sample-Mean Speed",
+            "kpi_p95_ttft": "P95 TTFT",
+            "kpi_samples": "Total Samples",
+            "models_selected": "Compare Models (up to 5):",
+            "reset_top5": "Top 5",
+            "reset_top5_tip": "Reset to top 5 sampled models",
+            "empty_title": "No speed samples recorded yet",
+            "empty_hint": "The proxy gateway will automatically record duration_ms and compute real-time token output speed on upcoming requests.",
+            "col_model": "Model & Distribution",
+            "col_comparison": "First Half (○) ➔ Second Half (●)",
+            "col_metrics": "P95 TTFT / Samples",
+            "insufficient_samples": "Samples clustered in one half; insufficient for comparison",
+            "requests_unit": "requests"
+        }
     },
     "errors": {
         "stream": {

@@ -1,5 +1,6 @@
 import i18n from '../i18n';
-import { Account, ActiveClientsStatus, DeviceProfile, DeviceProfileVersion, QuotaData, ImportAccountEntry, BatchImportResult } from '../types/account';
+import { Account, ActiveClientsStatus, DeviceProfile, DeviceProfileVersion, QuotaData, ImportAccountEntry, BatchImportResult, VertexCreditConfig } from '../types/account';
+export type { VertexCreditConfig };
 export type { ImportAccountEntry, BatchImportResult };
 import { request as invoke } from '../utils/request';
 
@@ -258,4 +259,10 @@ export async function updateAccountProjectId(accountId: string, projectId: strin
 
 export async function autoFetchAccountProjectId(accountId: string): Promise<string> {
     return await invoke('auto_fetch_account_project_id', { accountId });
+}
+
+
+// Vertex AI / Google Cloud 赠金配置
+export async function updateVertexCredit(accountId: string, config: VertexCreditConfig): Promise<Account> {
+    return await invoke('update_vertex_credit_config', { accountId, config });
 }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 // use std::path::PathBuf;
 use crate::proxy::mappers::cloak_obfuscate::SensitiveWordMatcher;
+use crate::proxy::mappers::prompt_rewrite::PromptRewriter;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -178,6 +179,56 @@ pub fn update_sensitive_word_obfuscation_config(config: SensitiveWordObfuscation
             config.enabled,
             config.scope,
             config.sensitive_words.len()
+        );
+    }
+}
+
+// ============================================================================
+// 提示词改写配置存储（严格字面匹配并替换）
+// ============================================================================
+static GLOBAL_PROMPT_REWRITE_CONFIG: OnceLock<
+    RwLock<(PromptRewriteConfig, Option<Arc<PromptRewriter>>)>,
+> = OnceLock::new();
+
+pub fn get_prompt_rewrite_config() -> PromptRewriteConfig {
+    GLOBAL_PROMPT_REWRITE_CONFIG
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|guard| guard.0.clone())
+        .unwrap_or_default()
+}
+
+pub fn get_prompt_rewriter() -> Option<Arc<PromptRewriter>> {
+    GLOBAL_PROMPT_REWRITE_CONFIG
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .and_then(|guard| guard.1.clone())
+}
+
+pub fn update_prompt_rewrite_config(config: PromptRewriteConfig) {
+    let rewriter = if config.enabled && !config.rules.is_empty() {
+        PromptRewriter::from_rules(&config.rules).map(Arc::new)
+    } else {
+        None
+    };
+
+    if let Some(lock) = GLOBAL_PROMPT_REWRITE_CONFIG.get() {
+        if let Ok(mut state) = lock.write() {
+            *state = (config.clone(), rewriter);
+            tracing::info!(
+                "[Prompt-Rewrite] Config updated: enabled={}, scope={:?}, rules_count={}",
+                config.enabled,
+                config.scope,
+                config.rules.len()
+            );
+        }
+    } else {
+        let _ = GLOBAL_PROMPT_REWRITE_CONFIG.set(RwLock::new((config.clone(), rewriter)));
+        tracing::info!(
+            "[Prompt-Rewrite] Config initialized: enabled={}, scope={:?}, rules_count={}",
+            config.enabled,
+            config.scope,
+            config.rules.len()
         );
     }
 }
@@ -547,6 +598,61 @@ impl Default for SensitiveWordObfuscationConfig {
             enabled: false,
             scope: SensitiveWordObfuscationScope::default(),
             sensitive_words: Vec::new(),
+        }
+    }
+}
+
+/// 提示词改写生效范围
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptRewriteScope {
+    #[default]
+    SystemInstruction,
+    SystemAndMessages,
+}
+
+fn default_rule_enabled() -> bool {
+    true
+}
+
+/// 提示词改写单条规则（严格字面匹配并替换）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptRewriteRule {
+    #[serde(default = "default_rule_enabled")]
+    pub enabled: bool,
+    #[serde(rename = "match")]
+    pub r#match: String,
+    #[serde(default)]
+    pub replace: String,
+}
+
+impl Default for PromptRewriteRule {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            r#match: String::new(),
+            replace: String::new(),
+        }
+    }
+}
+
+/// 提示词改写配置（严格字面匹配并替换）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptRewriteConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub scope: PromptRewriteScope,
+    #[serde(default)]
+    pub rules: Vec<PromptRewriteRule>,
+}
+
+impl Default for PromptRewriteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scope: PromptRewriteScope::default(),
+            rules: Vec::new(),
         }
     }
 }
@@ -1290,6 +1396,9 @@ pub struct ProxyConfig {
     /// 零宽字符敏感词脱敏配置
     #[serde(default)]
     pub sensitive_word_obfuscation: SensitiveWordObfuscationConfig,
+    /// 提示词改写配置（严格匹配并替换）
+    #[serde(default)]
+    pub prompt_rewrite: PromptRewriteConfig,
 
     /// 图像思维模式配置
     /// - enabled: 保留思维链 (默认)
@@ -1485,6 +1594,7 @@ impl Default for ProxyConfig {
             thinking_budget: ThinkingBudgetConfig::default(),
             global_system_prompt: GlobalSystemPromptConfig::default(),
             sensitive_word_obfuscation: SensitiveWordObfuscationConfig::default(),
+            prompt_rewrite: PromptRewriteConfig::default(),
             proxy_pool: ProxyPoolConfig::default(),
             multimodal: MultimodalConfig::default(),
             stream_timeouts: StreamTimeoutConfig::default(),
@@ -1699,5 +1809,92 @@ mod sensitive_word_config_tests {
             sensitive_words: vec!["custom_keyword".to_string()],
         });
         assert!(get_sensitive_word_matcher().is_none());
+    }
+}
+
+#[cfg(test)]
+mod prompt_rewrite_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_prompt_rewrite_config_defaults_and_backward_compat() {
+        // Deserializing ProxyConfig when prompt_rewrite field is missing
+        let json_data = r#"{
+            "enabled": true,
+            "port": 8045,
+            "api_key": "test_key",
+            "auto_start": false,
+            "request_timeout": 120,
+            "enable_logging": true,
+            "upstream_proxy": { "enabled": false, "url": "" }
+        }"#;
+
+        let cfg: ProxyConfig =
+            serde_json::from_str(json_data).expect("should deserialize without prompt_rewrite");
+        assert_eq!(cfg.prompt_rewrite.enabled, false);
+        assert_eq!(
+            cfg.prompt_rewrite.scope,
+            PromptRewriteScope::SystemInstruction
+        );
+        assert!(cfg.prompt_rewrite.rules.is_empty());
+
+        // Serializing with prompt_rewrite
+        let mut custom = cfg.clone();
+        custom.prompt_rewrite = PromptRewriteConfig {
+            enabled: true,
+            scope: PromptRewriteScope::SystemAndMessages,
+            rules: vec![PromptRewriteRule {
+                enabled: true,
+                r#match: "old".to_string(),
+                replace: "new".to_string(),
+            }],
+        };
+
+        let serialized = serde_json::to_string(&custom).expect("should serialize");
+        let deserialized: ProxyConfig =
+            serde_json::from_str(&serialized).expect("should roundtrip");
+        assert_eq!(deserialized.prompt_rewrite, custom.prompt_rewrite);
+        assert!(serialized.contains(r#""match":"old""#));
+    }
+
+    #[test]
+    fn test_update_prompt_rewrite_config_updates_rewriter() {
+        let _lock = TEST_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                update_prompt_rewrite_config(PromptRewriteConfig::default());
+            }
+        }
+        let _guard = ResetGuard;
+
+        update_prompt_rewrite_config(PromptRewriteConfig {
+            enabled: true,
+            scope: PromptRewriteScope::SystemInstruction,
+            rules: vec![PromptRewriteRule {
+                enabled: true,
+                r#match: "foo".to_string(),
+                replace: "bar".to_string(),
+            }],
+        });
+
+        let rewriter =
+            get_prompt_rewriter().expect("rewriter should be present when enabled with rules");
+        let (out, modified) = rewriter.apply_to_text("Prefix foo Suffix");
+        assert!(modified);
+        assert_eq!(out, "Prefix bar Suffix");
+
+        // Disable and verify rewriter is cleared
+        update_prompt_rewrite_config(PromptRewriteConfig {
+            enabled: false,
+            scope: PromptRewriteScope::SystemInstruction,
+            rules: vec![PromptRewriteRule {
+                enabled: true,
+                r#match: "foo".to_string(),
+                replace: "bar".to_string(),
+            }],
+        });
+        assert!(get_prompt_rewriter().is_none());
     }
 }

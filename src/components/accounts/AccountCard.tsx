@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Repeat2, Terminal } from 'lucide-react';
-import { Account, ActiveClientsStatus, getAccountTier, hasAccountArgonCapability } from '../../types/account';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Repeat2, Terminal, Coins, Globe } from 'lucide-react';
+import { Account, ActiveClientsStatus, getAccountTier, hasAccountArgonCapability, isVertexAccount, VertexAccountInfo } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
 import { useConfigStore } from '../../stores/useConfigStore';
@@ -12,7 +12,7 @@ import { showToast } from '../common/ToastContainer';
 import { releaseAccountQoSJail } from '../../services/accountService';
 import { QoSStatusBadge } from './QoSStatusBadge';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
-import { getGroupQuotaSummaries } from '../../utils/quotaDisplay';
+import { getGroupQuotaSummaries, formatCurrencyAmount } from '../../utils/quotaDisplay';
 
 interface AccountCardProps {
     account: Account;
@@ -83,6 +83,38 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
     };
 
     const tier = useMemo(() => getAccountTier(account), [account]);
+    const isVertex = useMemo(() => isVertexAccount(account), [account]);
+    const vertexInfo: VertexAccountInfo | undefined = useMemo(() => {
+        if (account.vertex_info) return account.vertex_info;
+        if (!isVertex) return undefined;
+        const sa = account.token?.service_account;
+        const cred = account.token?.vertex_credit;
+        const projectId = account.token?.project_id || sa?.project_id || "";
+        const location = account.token?.vertex_location || "global";
+        const initial = cred?.initial_credit ?? 300.0;
+        const currency = cred?.currency || "USD";
+        const spent = cred?.external_spent ?? 0.0;
+        return {
+            project_id: projectId,
+            location,
+            client_email: sa?.client_email || account.email,
+            billing_account_id: cred?.billing_account_id,
+            credit_configured: Boolean(cred),
+            initial_credit: initial,
+            currency,
+            external_spent: spent,
+            exchange_rate: cred?.exchange_rate ?? 1.0,
+            local_estimated_spent_usd: 0.0,
+            total_spent: spent,
+            remaining_credit: Math.max(0, initial - spent),
+            baseline_timestamp: cred?.baseline_timestamp,
+            expires_at: cred?.expires_at,
+            total_requests: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cached_tokens: 0,
+        };
+    }, [account, isVertex]);
     const groupSummaries = useMemo(() => {
         return getGroupQuotaSummaries(account.quota?.quota_groups, account.quota?.models, tier);
     }, [account.quota?.quota_groups, account.quota?.models, tier]);
@@ -310,6 +342,75 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
                         </button>
                     </div>
                 ) : (
+                    isVertex ? (
+                        <div className="flex flex-col gap-2 p-2.5 rounded-xl border border-emerald-200/60 dark:border-emerald-800/40 bg-gradient-to-br from-emerald-50/40 via-teal-50/20 to-sky-50/30 dark:from-emerald-950/20 dark:via-base-100 dark:to-teal-950/20">
+                            <div className="flex items-center justify-between gap-1.5 text-xs">
+                                <div className="flex items-center gap-1.5 min-w-0">
+                                    <span className="px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/50 text-emerald-800 dark:text-emerald-300 font-mono text-[10px] font-bold flex items-center gap-1 shrink-0">
+                                        <Globe className="w-2.5 h-2.5" />
+                                        {vertexInfo?.location || 'global'}
+                                    </span>
+                                    <span className="font-mono font-medium text-gray-700 dark:text-gray-300 text-[11px] truncate" title={vertexInfo?.project_id}>
+                                        {vertexInfo?.project_id || t('accounts.vertex.no_project', { defaultValue: '未关联 Project ID' })}
+                                    </span>
+                                </div>
+                                <span className="text-[10px] font-mono text-emerald-600 dark:text-emerald-400 font-bold shrink-0">
+                                    Vertex AI · GCP
+                                </span>
+                            </div>
+
+                            {vertexInfo?.credit_configured ? (
+                                <div className="flex flex-col gap-1.5 pt-1 border-t border-emerald-100 dark:border-emerald-900/30">
+                                    <div className="flex items-center justify-between text-xs">
+                                        <span className="flex items-center gap-1 font-semibold text-gray-700 dark:text-gray-200 text-[11px]">
+                                            <Coins className="w-3 h-3 text-emerald-500" />
+                                            {t('accounts.vertex.credit_balance', { defaultValue: '赠金余额' })}
+                                        </span>
+                                        <div className="flex items-baseline gap-1 font-mono text-xs font-bold text-emerald-700 dark:text-emerald-300">
+                                            <span>{formatCurrencyAmount(vertexInfo.remaining_credit, vertexInfo.currency)}</span>
+                                            <span className="text-[10px] font-normal text-gray-400 dark:text-gray-500">
+                                                / {formatCurrencyAmount(vertexInfo.initial_credit, vertexInfo.currency)}
+                                            </span>
+                                        </div>
+                                    </div>
+
+                                    {/* Progress Bar */}
+                                    <div className="w-full h-1.5 bg-gray-100 dark:bg-base-200 rounded-full overflow-hidden">
+                                        <div
+                                            className="h-full bg-gradient-to-r from-emerald-500 to-teal-500 rounded-full transition-all duration-500"
+                                            style={{ width: `${Math.min(100, Math.max(0, (vertexInfo?.initial_credit || 0) > 0 ? ((vertexInfo?.remaining_credit || 0) / (vertexInfo?.initial_credit || 1)) * 100 : 0))}%` }}
+                                        />
+                                    </div>
+
+                                    <div className="flex items-center justify-between text-[10px] text-gray-500 dark:text-gray-400 font-mono">
+                                        <span>
+                                            {t('accounts.vertex.spent_label', { defaultValue: '已消耗' })}: {formatCurrencyAmount(vertexInfo.total_spent, vertexInfo.currency)}
+                                        </span>
+                                        {vertexInfo.expires_at ? (
+                                            <span className="text-amber-600 dark:text-amber-400 font-medium" title={t('accounts.vertex.expiry_tooltip', { defaultValue: '赠金有效期至' })}>
+                                                {vertexInfo.expires_at}
+                                            </span>
+                                        ) : (
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
+                                                className="text-blue-600 dark:text-blue-400 hover:underline"
+                                            >
+                                                {t('accounts.vertex.calibrate', { defaultValue: '校准' })}
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+                            ) : (
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
+                                    className="mt-1 w-full py-1.5 px-2 rounded-lg border border-dashed border-emerald-300 dark:border-emerald-700 bg-white/70 dark:bg-base-100/50 hover:bg-emerald-50 dark:hover:bg-emerald-950/30 text-emerald-700 dark:text-emerald-300 text-xs font-medium flex items-center justify-center gap-1.5 transition-all"
+                                >
+                                    <Coins className="w-3.5 h-3.5 text-emerald-500" />
+                                    <span>{t('accounts.vertex.setup_credit_hint', { defaultValue: '点击设置 00 赠金余额跟踪' })}</span>
+                                </button>
+                            )}
+                        </div>
+                    ) : (
                     <div className="flex flex-col gap-1.5 content-start">
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                             {groupSummaries.filter(s => s.key !== 'argon').map((summary) => (
@@ -336,6 +437,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, ac
                             );
                         })()}
                     </div>
+                    )
                 )}
             </div>
 

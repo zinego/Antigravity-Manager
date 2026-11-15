@@ -44,6 +44,7 @@ import { motion } from 'framer-motion';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
 import GlobalSystemPrompt from '../components/settings/GlobalSystemPrompt';
 import SensitiveWordObfuscation from '../components/settings/SensitiveWordObfuscation';
+import PromptRewrite from '../components/settings/PromptRewrite';
 import ImageThinkingMode from '../components/settings/ImageThinkingMode';
 import ThinkingBudget from '../components/settings/ThinkingBudget';
 import MultimodalSettings from '../components/settings/MultimodalSettings';
@@ -3059,6 +3060,13 @@ print(response.choices[0].message.content)`;
                                         <SensitiveWordObfuscation
                                             config={appConfig.proxy.sensitive_word_obfuscation || { enabled: false, scope: 'system_instruction', sensitive_words: [] }}
                                             onChange={(newConfig) => updateProxyConfig({ sensitive_word_obfuscation: newConfig })}
+                                        />
+                                    </div>
+                                    {/* 提示词改写 (严格匹配并替换) */}
+                                    <div className="pt-4 border-t border-gray-100 dark:border-base-300">
+                                        <PromptRewrite
+                                            config={appConfig.proxy.prompt_rewrite || { enabled: false, scope: 'system_instruction', rules: [] }}
+                                            onChange={(newConfig) => updateProxyConfig({ prompt_rewrite: newConfig })}
                                         />
                                     </div>
                                 </div>
