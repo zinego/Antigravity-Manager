@@ -328,7 +328,7 @@ pub fn openai_style_model_objects(entries: Vec<ModelListEntry>) -> Vec<serde_jso
                 "max_output_tokens": entry.output_limit,
                 "output_token_limit": entry.output_limit,
             });
-            if let Some(meta) = entry.metadata {
+            if let Some(meta) = &entry.metadata {
                 if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(meta) {
                     if let Some(target) = obj.as_object_mut() {
                         for (k, v) in map {
@@ -337,6 +337,85 @@ pub fn openai_style_model_objects(entries: Vec<ModelListEntry>) -> Vec<serde_jso
                     }
                 }
             }
+
+            // 1. 思考能力与档位广告 (Reasoning capability advertisement)
+            let mut efforts = crate::proxy::model_specs::available_efforts_for(&entry.id);
+            let supports_thinking = entry
+                .metadata
+                .as_ref()
+                .and_then(|m| m.supports_thinking)
+                .unwrap_or_else(|| !efforts.is_empty());
+
+            if supports_thinking && efforts.is_empty() {
+                efforts = vec!["low".to_string(), "medium".to_string(), "high".to_string()];
+            }
+
+            if let Some(target) = obj.as_object_mut() {
+                if supports_thinking && !efforts.is_empty() {
+                    let mut supported_reasoning_levels = vec!["none".to_string()];
+                    for eff in &efforts {
+                        if !supported_reasoning_levels.contains(eff) {
+                            supported_reasoning_levels.push(eff.clone());
+                        }
+                    }
+
+                    let default_level = if efforts.iter().any(|e| e == "high") {
+                        "high".to_string()
+                    } else if efforts.iter().any(|e| e == "medium") {
+                        "medium".to_string()
+                    } else {
+                        efforts[0].clone()
+                    };
+
+                    target.insert("reasoning".to_string(), serde_json::Value::Bool(true));
+                    target.insert(
+                        "supported_reasoning_levels".to_string(),
+                        serde_json::to_value(supported_reasoning_levels).unwrap_or_default(),
+                    );
+                    target.insert(
+                        "default_reasoning_level".to_string(),
+                        serde_json::Value::String(default_level),
+                    );
+                    target.insert(
+                        "supported_parameters".to_string(),
+                        serde_json::json!(["tools", "tool_choice", "reasoning"]),
+                    );
+                } else {
+                    target.insert("reasoning".to_string(), serde_json::Value::Bool(false));
+                    target.insert(
+                        "supported_parameters".to_string(),
+                        serde_json::json!(["tools", "tool_choice"]),
+                    );
+                }
+
+                // 2. 输入模态广告 (Input modalities advertisement)
+                let supports_images = entry
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.supports_images)
+                    .unwrap_or_else(|| {
+                        crate::models::OfficialModelCatalog::get(&entry.id)
+                            .and_then(|info| info.supports_images)
+                            .unwrap_or_else(|| {
+                                let lower = entry.id.to_lowercase();
+                                lower.contains("gemini")
+                                    || lower.contains("claude")
+                                    || lower.contains("gpt-4")
+                                    || lower.contains("vision")
+                            })
+                    });
+
+                let input_modalities = if supports_images {
+                    vec!["text", "image"]
+                } else {
+                    vec!["text"]
+                };
+                target.insert(
+                    "input_modalities".to_string(),
+                    serde_json::to_value(input_modalities).unwrap_or_default(),
+                );
+            }
+
             obj
         })
         .collect()
@@ -1403,6 +1482,64 @@ mod retry_after_tests {
                 "gemini-4-hydrogen".to_string(),
                 "gemini-4-hydrogen-high".to_string()
             ]
+        );
+    }
+    #[test]
+    fn test_openai_style_model_objects_reasoning_and_modalities() {
+        let make_entry = |id: &str,
+                          supports_thinking: Option<bool>,
+                          supports_images: Option<bool>| ModelListEntry {
+            id: id.to_string(),
+            context_limit: 1048576,
+            output_limit: 65536,
+            display_name: None,
+            metadata: Some(crate::models::quota::ModelListingMeta {
+                supports_thinking,
+                supports_images,
+                ..Default::default()
+            }),
+        };
+
+        let entries = vec![
+            make_entry("gemini-4-hydrogen", Some(true), Some(true)),
+            make_entry("custom-non-thinking", Some(false), Some(false)),
+        ];
+
+        let objs = openai_style_model_objects(entries);
+        assert_eq!(objs.len(), 2);
+
+        // gemini-4-hydrogen
+        let hydrogen = &objs[0];
+        assert_eq!(hydrogen["id"], "gemini-4-hydrogen");
+        assert_eq!(hydrogen["reasoning"], true);
+        let levels = hydrogen["supported_reasoning_levels"].as_array().unwrap();
+        let levels_str: Vec<&str> = levels.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(levels_str.contains(&"none"));
+        assert!(levels_str.contains(&"low"));
+        assert!(levels_str.contains(&"medium"));
+        assert!(levels_str.contains(&"high"));
+        assert_eq!(hydrogen["default_reasoning_level"], "high");
+        assert_eq!(
+            hydrogen["supported_parameters"],
+            serde_json::json!(["tools", "tool_choice", "reasoning"])
+        );
+        assert_eq!(
+            hydrogen["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+
+        // custom-non-thinking
+        let non_thinking = &objs[1];
+        assert_eq!(non_thinking["id"], "custom-non-thinking");
+        assert_eq!(non_thinking["reasoning"], false);
+        assert!(non_thinking.get("supported_reasoning_levels").is_none());
+        assert_eq!(
+            non_thinking["supported_parameters"],
+            serde_json::json!(["tools", "tool_choice"])
+        );
+        assert_eq!(
+            non_thinking["input_modalities"],
+            serde_json::json!(["text"])
         );
     }
 }
