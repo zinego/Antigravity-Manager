@@ -1034,12 +1034,14 @@ pub fn consolidate_tiered_model_ids(
             let lower = id.to_lowercase();
             for suffix in SUFFIXES {
                 if let Some(base) = lower.strip_suffix(suffix) {
-                    if !base.is_empty()
-                        && all_ids
-                            .iter()
-                            .any(|existing| existing.eq_ignore_ascii_case(base))
-                    {
-                        return false;
+                    if !base.is_empty() {
+                        let preview_base = format!("{}-preview", base);
+                        if all_ids.iter().any(|existing| {
+                            existing.eq_ignore_ascii_case(base)
+                                || existing.eq_ignore_ascii_case(&preview_base)
+                        }) {
+                            return false;
+                        }
                     }
                 }
             }
@@ -1906,6 +1908,20 @@ mod tests {
                 "gemini-4-hydrogen".to_string(),
                 "gemini-4-hydrogen-high".to_string()
             ]
+        );
+
+        // 基底为 -preview 时同样折叠分档变体（如 gemini-3-flash-preview 折叠 -low/-medium/-high）
+        let preview_ids = vec![
+            "gemini-3-flash-preview".to_string(),
+            "gemini-3-flash-low".to_string(),
+            "gemini-3-flash-medium".to_string(),
+            "gemini-3-flash-high".to_string(),
+        ];
+        let consolidated_preview =
+            consolidate_tiered_model_ids(preview_ids, &empty_custom, Some(&HashMap::new()));
+        assert_eq!(
+            consolidated_preview,
+            vec!["gemini-3-flash-preview".to_string()]
         );
     }
 }

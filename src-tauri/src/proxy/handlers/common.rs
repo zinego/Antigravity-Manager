@@ -202,12 +202,14 @@ pub fn is_tiered_variant_of_existing(
     let lower = id.to_lowercase();
     for suffix in SUFFIXES {
         if let Some(base) = lower.strip_suffix(suffix) {
-            if !base.is_empty()
-                && all_ids
-                    .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(base))
-            {
-                return true;
+            if !base.is_empty() {
+                let preview_base = format!("{}-preview", base);
+                if all_ids.iter().any(|existing| {
+                    existing.eq_ignore_ascii_case(base)
+                        || existing.eq_ignore_ascii_case(&preview_base)
+                }) {
+                    return true;
+                }
             }
         }
     }
@@ -1541,5 +1543,26 @@ mod retry_after_tests {
             non_thinking["input_modalities"],
             serde_json::json!(["text"])
         );
+    }
+    #[test]
+    fn test_consolidate_model_entries_preview_base() {
+        let make_entry = |id: &str| ModelListEntry {
+            id: id.to_string(),
+            context_limit: 1048576,
+            output_limit: 65536,
+            display_name: None,
+            metadata: None,
+        };
+
+        let entries = vec![
+            make_entry("gemini-3-flash-preview"),
+            make_entry("gemini-3-flash-low"),
+            make_entry("gemini-3-flash-medium"),
+            make_entry("gemini-3-flash-high"),
+        ];
+
+        let consolidated = consolidate_model_entries(entries, &std::collections::HashMap::new());
+        let ids: Vec<String> = consolidated.into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec!["gemini-3-flash-preview".to_string()]);
     }
 }
